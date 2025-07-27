@@ -587,6 +587,368 @@ def create_walking_circles_union(reachable_stops: Dict[str, Dict], graph: nx.DiG
     return union_polygons
 
 
+def seconds_to_time_str(seconds: int) -> str:
+    """Convert seconds since midnight to HH:MM:SS format"""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def time_str_to_seconds(time_str: str) -> int:
+    """Convert HH:MM:SS to seconds since midnight, handling times >= 24:00:00"""
+    parts = time_str.split(':')
+    hours = int(parts[0])
+    minutes = int(parts[1]) 
+    seconds = int(parts[2])
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def database_line_following_isochrone(conn: sqlite3.Connection, 
+                                    walkable_stops: List[Dict],
+                                    start_time_seconds: int,
+                                    max_total_time_minutes: int,
+                                    date_str: str) -> Dict[str, Dict]:
+    """
+    Database-driven line-following algorithm that explores transit lines and transfers
+    without building a graph in memory. Uses targeted SQL queries to follow lines.
+    
+    Args:
+        conn: Database connection
+        walkable_stops: List of stops reachable by walking from origin
+        start_time_seconds: Departure time in seconds since midnight  
+        max_total_time_minutes: Maximum total travel time
+        date_str: Date in YYYYMMDD format for service validation
+        
+    Returns:
+        Dictionary mapping stop_id to travel information
+    """
+    max_total_time_seconds = max_total_time_minutes * 60
+    end_time_seconds = start_time_seconds + max_total_time_seconds
+    
+    console.print(f"[cyan]Database line-following from {len(walkable_stops)} walkable stops...[/cyan]")
+    console.print(f"[dim]Time window: {seconds_to_time_str(start_time_seconds)} - {seconds_to_time_str(end_time_seconds)}[/dim]")
+    
+    # Get active trips for the date
+    active_trips = get_active_trips_on_date(conn, date_str)
+    active_trips_set = set(active_trips)
+    console.print(f"[dim]Using {len(active_trips):,} active trips for {date_str}[/dim]")
+    
+    # Track visited stops with earliest arrival time
+    visited = {}  # stop_id -> earliest_arrival_time_seconds
+    
+    # Simple queue for exploration: (stop_id, arrival_time, total_time_minutes)
+    to_explore = []
+    
+    # Initialize with walkable starting stops
+    for walkable_stop in walkable_stops:
+        stop_id = walkable_stop['stop_id']
+        walk_time_seconds = int(walkable_stop['walk_time_minutes'] * 60)
+        arrival_at_stop = start_time_seconds + walk_time_seconds
+        
+        if arrival_at_stop < end_time_seconds:
+            to_explore.append((stop_id, arrival_at_stop, walk_time_seconds / 60.0))
+    
+    console.print(f"[green]Starting with {len(to_explore)} walkable stops[/green]")
+    
+    # Result storage
+    reachable_stops = {}
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console
+    ) as progress:
+        task = progress.add_task("Exploring transit network...", total=None)
+        
+        iterations = 0
+        while to_explore:
+            iterations += 1
+            
+            if iterations % 50 == 0:
+                progress.update(task, description=f"Exploring... ({len(visited)} visited, {len(to_explore)} queued)")
+            
+            # Get next stop to explore
+            current_stop, arrival_time, total_time_minutes = to_explore.pop(0)
+            
+            # Skip if we've already visited this stop with a better time
+            if current_stop in visited and visited[current_stop] <= arrival_time:
+                continue
+            
+            # Mark as visited with this arrival time
+            visited[current_stop] = arrival_time
+            
+            # Add to results
+            reachable_stops[current_stop] = {
+                'arrival_time': arrival_time,
+                'total_time': total_time_minutes
+            }
+            
+            # Find all trips departing from this stop after we arrive
+            departing_trips = query_departing_trips_simple(
+                conn, current_stop, arrival_time, end_time_seconds, date_str
+            )
+            
+            for trip_id, departure_time, boarding_sequence, route_name in departing_trips:
+                # Get ALL downstream stops on this trip in one query
+                downstream_stops = query_all_stops_on_trip(
+                    conn, trip_id, boarding_sequence, end_time_seconds
+                )
+                
+                # Add each reachable stop to exploration queue
+                for stop_id, stop_arrival_time in downstream_stops:
+                    # Calculate total travel time
+                    total_time_to_stop = (stop_arrival_time - start_time_seconds) / 60.0
+                    
+                    # Only explore if we haven't seen it with better time
+                    if stop_id not in visited or stop_arrival_time < visited[stop_id]:
+                        to_explore.append((stop_id, stop_arrival_time, total_time_to_stop))
+            
+            # Also check transfers from this stop
+            if total_time_minutes < max_total_time_minutes - 5:  # At least 5 min for transfers
+                transfers = query_direct_transfers(conn, current_stop)
+                
+                for to_stop_id, transfer_time_seconds in transfers:
+                    transfer_arrival = arrival_time + (transfer_time_seconds or 300)  # Default 5 min
+                    
+                    if transfer_arrival < end_time_seconds:
+                        total_time_to_transfer = (transfer_arrival - start_time_seconds) / 60.0
+                        
+                        if to_stop_id not in visited or transfer_arrival < visited[to_stop_id]:
+                            to_explore.append((to_stop_id, transfer_arrival, total_time_to_transfer))
+    
+    console.print(f"[green]Explored {iterations} iterations, found {len(reachable_stops)} reachable stops[/green]")
+    return reachable_stops
+
+
+def query_departing_trips_simple(conn: sqlite3.Connection, stop_id: str, 
+                                earliest_departure: int, latest_departure: int,
+                                date_str: str) -> List[tuple]:
+    """Find trips departing from a stop within time window"""
+    cursor = conn.cursor()
+    
+    # Convert to time strings
+    earliest_str = seconds_to_time_str(earliest_departure)
+    latest_str = seconds_to_time_str(latest_departure)
+    
+    # Use service-based filtering which is more efficient than trip-level
+    
+    query = """
+    SELECT DISTINCT
+        st.trip_id,
+        st.departure_time,
+        st.stop_sequence,
+        r.route_short_name
+    FROM stop_times st
+    JOIN trips t ON st.trip_id = t.trip_id
+    JOIN routes r ON t.route_id = r.route_id
+    WHERE st.stop_id = ?
+      AND st.departure_time >= ?
+      AND st.departure_time <= ?
+      AND t.service_id IN (
+          SELECT service_id FROM calendar_dates 
+          WHERE date = ? AND exception_type = 1
+      )
+    ORDER BY st.departure_time
+    LIMIT 100
+    """
+    
+    params = [stop_id, earliest_str, latest_str, date_str]
+    cursor.execute(query, params)
+    
+    results = []
+    for trip_id, dep_time_str, stop_seq, route_name in cursor.fetchall():
+        dep_time_seconds = time_str_to_seconds(dep_time_str)
+        results.append((trip_id, dep_time_seconds, stop_seq, route_name))
+    
+    return results
+
+
+def query_all_stops_on_trip(conn: sqlite3.Connection, trip_id: str,
+                           after_sequence: int, before_time: int) -> List[tuple]:
+    """Get all downstream stops on a trip"""
+    cursor = conn.cursor()
+    
+    before_time_str = seconds_to_time_str(before_time)
+    
+    query = """
+    SELECT stop_id, arrival_time
+    FROM stop_times
+    WHERE trip_id = ?
+      AND stop_sequence > ?
+      AND arrival_time <= ?
+    ORDER BY stop_sequence
+    """
+    
+    cursor.execute(query, (trip_id, after_sequence, before_time_str))
+    
+    results = []
+    for stop_id, arrival_str in cursor.fetchall():
+        arrival_seconds = time_str_to_seconds(arrival_str)
+        results.append((stop_id, arrival_seconds))
+    
+    return results
+
+
+def query_direct_transfers(conn: sqlite3.Connection, from_stop_id: str) -> List[tuple]:
+    """Find direct transfer opportunities from a stop"""
+    cursor = conn.cursor()
+    
+    query = """
+    SELECT to_stop_id, min_transfer_time
+    FROM transfers
+    WHERE from_stop_id = ?
+      AND from_stop_id != to_stop_id
+    LIMIT 20
+    """
+    
+    cursor.execute(query, (from_stop_id,))
+    return cursor.fetchall()
+
+
+def query_departing_lines(conn: sqlite3.Connection, stop_id: str, earliest_departure: int,
+                         latest_departure: int, active_trips: set) -> List[Dict]:
+    """Find all lines departing from a stop within a time window"""
+    cursor = conn.cursor()
+    
+    # Convert seconds to time strings for SQL query
+    earliest_time_str = seconds_to_time_str(earliest_departure)
+    latest_time_str = seconds_to_time_str(latest_departure)
+    
+    # Create a temporary table for active trips to avoid large IN clauses
+    # Use a more compatible approach that works with older SQLite versions
+    if len(active_trips) > 1000:
+        # For large trip sets, use a different approach
+        active_trips_sample = list(active_trips)[:1000]  # Limit to avoid query complexity
+    else:
+        active_trips_sample = list(active_trips)
+    
+    # Create IN clause with proper escaping
+    trip_placeholders = ','.join('?' * len(active_trips_sample))
+    
+    query = f"""
+    SELECT DISTINCT 
+        t.route_id,
+        t.trip_id,
+        st.departure_time,
+        r.route_short_name
+    FROM stop_times st
+    JOIN trips t ON st.trip_id = t.trip_id
+    JOIN routes r ON t.route_id = r.route_id
+    WHERE st.stop_id = ?
+      AND st.departure_time >= ?
+      AND st.departure_time <= ?
+      AND st.trip_id IN ({trip_placeholders})
+    ORDER BY st.departure_time
+    LIMIT 50
+    """
+    
+    query_params = [stop_id, earliest_time_str, latest_time_str] + active_trips_sample
+    cursor.execute(query, query_params)
+    
+    results = []
+    for route_id, trip_id, departure_time_str, route_short_name in cursor.fetchall():
+        results.append({
+            'route_id': route_id,
+            'trip_id': trip_id, 
+            'departure_time': time_str_to_seconds(departure_time_str),
+            'route_short_name': route_short_name
+        })
+    
+    return results
+
+
+def query_line_segment_reachable(conn: sqlite3.Connection, trip_id: str, origin_stop: str,
+                               departure_time: int, max_travel_time: int) -> List[Dict]:
+    """Find all stops reachable on a specific trip within time limit"""
+    cursor = conn.cursor()
+    
+    # Find the origin stop's sequence number
+    cursor.execute("""
+        SELECT stop_sequence FROM stop_times 
+        WHERE trip_id = ? AND stop_id = ?
+    """, (trip_id, origin_stop))
+    
+    origin_result = cursor.fetchone()
+    if not origin_result:
+        return []
+    
+    origin_sequence = origin_result[0]
+    max_arrival_time = departure_time + max_travel_time
+    max_arrival_str = seconds_to_time_str(max_arrival_time)
+    
+    # Find all subsequent stops on this trip within time limit
+    cursor.execute("""
+        SELECT stop_id, arrival_time, stop_sequence
+        FROM stop_times
+        WHERE trip_id = ?
+          AND stop_sequence > ?
+          AND arrival_time <= ?
+        ORDER BY stop_sequence
+    """, (trip_id, origin_sequence, max_arrival_str))
+    
+    results = []
+    for stop_id, arrival_time_str, stop_sequence in cursor.fetchall():
+        arrival_time = time_str_to_seconds(arrival_time_str)
+        if arrival_time <= max_arrival_time:
+            results.append({
+                'stop_id': stop_id,
+                'arrival_time': arrival_time,
+                'stop_sequence': stop_sequence
+            })
+    
+    return results
+
+
+def query_transfers_on_line_segment(conn: sqlite3.Connection, trip_id: str, 
+                                  origin_stop: str, max_travel_time: int) -> List[Dict]:
+    """Find transfer opportunities along a trip segment"""
+    cursor = conn.cursor()
+    
+    # Get origin sequence and departure time
+    cursor.execute("""
+        SELECT stop_sequence, departure_time FROM stop_times 
+        WHERE trip_id = ? AND stop_id = ?
+    """, (trip_id, origin_stop))
+    
+    origin_result = cursor.fetchone()
+    if not origin_result:
+        return []
+    
+    origin_sequence, origin_departure_str = origin_result
+    origin_departure_time = time_str_to_seconds(origin_departure_str)
+    max_arrival_time = origin_departure_time + max_travel_time
+    max_arrival_str = seconds_to_time_str(max_arrival_time)
+    
+    # Find transfers available from stops on this trip segment
+    cursor.execute("""
+        SELECT 
+            st.stop_id,
+            st.arrival_time,
+            tr.to_stop_id,
+            tr.min_transfer_time
+        FROM stop_times st
+        JOIN transfers tr ON st.stop_id = tr.from_stop_id
+        WHERE st.trip_id = ?
+          AND st.stop_sequence > ?
+          AND st.arrival_time <= ?
+        ORDER BY st.stop_sequence
+        LIMIT 20
+    """, (trip_id, origin_sequence, max_arrival_str))
+    
+    results = []
+    for stop_id, arrival_time_str, to_stop_id, min_transfer_time in cursor.fetchall():
+        arrival_time = time_str_to_seconds(arrival_time_str)
+        results.append({
+            'stop_id': stop_id,
+            'arrival_time': arrival_time,
+            'to_stop_id': to_stop_id,
+            'min_transfer_time': min_transfer_time
+        })
+    
+    return results
+
+
 def union_polygons_to_points(union_polygons: Dict[str, Polygon], reachable_stops: Dict[str, Dict], 
                            graph: nx.DiGraph, sample_density: float = 0.002) -> Dict[str, Dict]:
     """
@@ -740,7 +1102,7 @@ def add_schedule_based_walking_expansion(reachable_stops: Dict[str, Dict], conn:
         }
         
         # Calculate remaining time for walking and create circle
-        transit_time = stop_info['total_time_minutes']
+        transit_time = stop_info.get('total_time_minutes', stop_info.get('total_time', 0))
         remaining_time = max_total_time_minutes - transit_time
         
         if remaining_time > 0:
@@ -1650,7 +2012,8 @@ def build_graph(db_path: str, lat: float, lon: float, max_time: int, max_walk: i
 @click.option('--departure', default='08:00', help='Departure time (HH:MM format)')
 @click.option('--visualize', is_flag=True, help='Generate interactive map after calculation')
 @click.option('--map-output', default='isochrone_map.html', help='Output HTML file for map (if --visualize)')
-def query(db_path: str, address: str, lat: float, lon: float, max_time: int, date: str, departure: str, visualize: bool, map_output: str):
+@click.option('--database-driven', is_flag=True, help='Use database-driven line-following algorithm (experimental)')
+def query(db_path: str, address: str, lat: float, lon: float, max_time: int, date: str, departure: str, visualize: bool, map_output: str, database_driven: bool):
     """Find all stops reachable within the given time from an address or coordinates"""
     
     # Check if database exists
@@ -1696,9 +2059,6 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
         stop_lines_mapping = get_stop_lines_mapping(conn)
         optimized_walkable_stops = optimize_walkable_stops_by_line_coverage(walkable_stops, stop_lines_mapping)
         
-        # Use schedule-based routing with actual GTFS times
-        console.print(f"\n[bold cyan]Using schedule-based routing for {date}[/bold cyan]")
-        
         # Parse departure time
         dep_hours, dep_mins = map(int, departure.split(':'))
         start_time_seconds = dep_hours * 3600 + dep_mins * 60
@@ -1713,28 +2073,50 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
             console.print(f"[red]Invalid date format: {date}. Use YYYYMMDD format.[/red]")
             return
         
-        # Build time-dependent graph
-        console.print(f"\n[cyan]Building time-dependent transit graph...[/cyan]")
-        graph = build_time_dependent_graph(
-            conn,
-            start_lat=start_lat,
-            start_lon=start_lon,
-            date_str=date,
-            start_time_seconds=start_time_seconds,
-            max_time_minutes=max_time,
-            max_walking_distance_m=500
-        )
-        
-        if graph.number_of_nodes() == 0:
-            console.print("[yellow]No reachable stops found for the given parameters[/yellow]")
-            console.print("[dim]This might be because no services run on this date/time[/dim]")
-            return
-        
-        # Calculate time-dependent isochrone
-        console.print(f"\n[cyan]Calculating schedule-based isochrone...[/cyan]")
-        reachable_stops = calculate_time_dependent_isochrone(
-            graph, optimized_walkable_stops, start_time_seconds, max_time
-        )
+        # Choose algorithm based on flag
+        if database_driven:
+            # Use new database-driven line-following algorithm
+            console.print(f"\n[bold cyan]Using database-driven line-following algorithm for {date}[/bold cyan]")
+            console.print("[dim]This approach uses targeted SQL queries instead of building graphs in memory[/dim]")
+            
+            reachable_stops = database_line_following_isochrone(
+                conn, optimized_walkable_stops, start_time_seconds, max_time, date
+            )
+            
+            # Create a mock graph for compatibility with visualization
+            class MockGraph:
+                def __init__(self):
+                    pass
+                def number_of_nodes(self):
+                    return len(reachable_stops)
+            
+            graph = MockGraph()
+        else:
+            # Use existing schedule-based routing with time-dependent graph
+            console.print(f"\n[bold cyan]Using schedule-based graph routing for {date}[/bold cyan]")
+            
+            # Build time-dependent graph
+            console.print(f"\n[cyan]Building time-dependent transit graph...[/cyan]")
+            graph = build_time_dependent_graph(
+                conn,
+                start_lat=start_lat,
+                start_lon=start_lon,
+                date_str=date,
+                start_time_seconds=start_time_seconds,
+                max_time_minutes=max_time,
+                max_walking_distance_m=500
+            )
+            
+            if graph.number_of_nodes() == 0:
+                console.print("[yellow]No reachable stops found for the given parameters[/yellow]")
+                console.print("[dim]This might be because no services run on this date/time[/dim]")
+                return
+            
+            # Calculate time-dependent isochrone
+            console.print(f"\n[cyan]Calculating schedule-based isochrone...[/cyan]")
+            reachable_stops = calculate_time_dependent_isochrone(
+                graph, optimized_walkable_stops, start_time_seconds, max_time
+            )
         
         if not reachable_stops:
             console.print("[yellow]No stops reachable within time limit[/yellow]")
@@ -1767,7 +2149,7 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
                 
             points_in_range = [
                 (point_id, info) for point_id, info in expanded_points.items()
-                if min_time <= info['total_time_minutes'] <= max_range
+                if min_time <= info.get('total_time_minutes', info.get('total_time', 0)) <= max_range
             ]
             
             if points_in_range:
@@ -1778,14 +2160,16 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
                 console.print(f"[dim]  {len(transit_stops)} transit stops + {len(walking_points)} walking destinations[/dim]")
                 
                 # Show a few examples with breakdown
-                examples = sorted(points_in_range, key=lambda x: x[1]['total_time_minutes'])[:3]
+                examples = sorted(points_in_range, key=lambda x: x[1].get('total_time_minutes', x[1].get('total_time', 0)))[:3]
                 for point_id, info in examples:
                     if info['point_type'] == 'transit_stop':
-                        console.print(f"  🚏 {info['name'][:30]}: {info['total_time_minutes']:.1f}min " +
+                        total_time_display = info.get('total_time_minutes', info.get('total_time', 0))
+                        console.print(f"  🚏 {info['name'][:30]}: {total_time_display:.1f}min " +
                                     f"(walk {info.get('walk_time_minutes', 0):.1f} + transit {info.get('transit_time_minutes', 0):.1f})")
                     else:
-                        console.print(f"  🚶 {info['name'][:30]}: {info['total_time_minutes']:.1f}min " +
-                                    f"(+{info['end_walk_time_minutes']:.1f}min walk from transit)")
+                        total_time_display = info.get('total_time_minutes', info.get('total_time', 0))
+                        console.print(f"  🚶 {info['name'][:30]}: {total_time_display:.1f}min " +
+                                    f"(+{info.get('end_walk_time_minutes', 0):.1f}min walk from transit)")
                 
                 if len(points_in_range) > 3:
                     console.print(f"  ... and {len(points_in_range) - 3} more points")
