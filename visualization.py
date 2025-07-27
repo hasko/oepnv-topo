@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""
+Visualization module for ÖPNV Topo - Creates interactive maps with isochrone overlays
+"""
+import folium
+import geopandas as gpd
+import alphashape
+from shapely.geometry import Point, Polygon, MultiPolygon
+from shapely.ops import transform
+import pandas as pd
+from typing import List, Dict, Tuple, Optional
+from rich.console import Console
+import os
+
+console = Console()
+
+
+def points_to_polygon(points: List[Tuple[float, float]], alpha: float = 0.0) -> Optional[Polygon]:
+    """
+    Convert a list of (lat, lon) points to a polygon using alpha shapes.
+    
+    Args:
+        points: List of (latitude, longitude) tuples
+        alpha: Alpha parameter for shape (0.0 = convex hull, higher = more detailed)
+    
+    Returns:
+        Shapely Polygon or None if conversion fails
+    """
+    if len(points) < 3:
+        console.print("[yellow]Warning: Need at least 3 points to create polygon[/yellow]")
+        return None
+    
+    try:
+        # Ensure we have valid coordinate tuples
+        valid_points = []
+        for point in points:
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                lat, lon = float(point[0]), float(point[1])
+                # Note: shapely uses (x, y) = (lon, lat)
+                valid_points.append((lon, lat))
+            else:
+                console.print(f"[dim]Skipping invalid point: {point}[/dim]")
+        
+        if len(valid_points) < 3:
+            console.print(f"[yellow]Warning: Only {len(valid_points)} valid points after filtering[/yellow]")
+            return None
+        
+        console.print(f"[dim]Creating polygon from {len(valid_points)} points[/dim]")
+        
+        # Generate alpha shape (alphashape expects coordinate tuples, not Point objects)
+        alpha_shape = alphashape.alphashape(valid_points, alpha)
+        
+        # Handle MultiPolygon by taking the largest polygon
+        if isinstance(alpha_shape, MultiPolygon):
+            # Get the polygon with the largest area
+            alpha_shape = max(alpha_shape.geoms, key=lambda p: p.area)
+        
+        return alpha_shape if isinstance(alpha_shape, Polygon) else None
+        
+    except Exception as e:
+        console.print(f"[red]Error creating polygon: {e}[/red]")
+        return None
+
+
+def create_isochrone_map(
+    center_lat: float,
+    center_lon: float,
+    reachable_points: Dict[str, Dict],
+    title: str = "Public Transport Isochrone",
+    output_file: str = "isochrone_map.html"
+) -> str:
+    """
+    Create an interactive map showing reachable areas as polygon overlays.
+    
+    Args:
+        center_lat: Center latitude (starting point)
+        center_lon: Center longitude (starting point)
+        reachable_points: Dictionary of reachable stops with coordinates and times
+        title: Map title
+        output_file: Output HTML filename
+    
+    Returns:
+        Path to generated HTML file
+    """
+    console.print(f"[cyan]Creating interactive map: {title}[/cyan]")
+    
+    # Initialize map centered on starting location
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=12,
+        tiles='OpenStreetMap'
+    )
+    
+    # Add title
+    title_html = f'''
+                 <h3 align="center" style="font-size:16px; margin-top:10px;"><b>{title}</b></h3>
+                 '''
+    m.get_root().html.add_child(folium.Element(title_html))
+    
+    # Add center marker
+    folium.Marker(
+        [center_lat, center_lon],
+        popup="Starting Point",
+        tooltip="Starting Point",
+        icon=folium.Icon(color='red', icon='play')
+    ).add_to(m)
+    
+    # Group points by time ranges for different colored overlays
+    # Using magenta/purple colors to avoid conflict with green areas on OSM
+    time_ranges = [
+        (0, 10, '#ff00ff', 'magenta'),      # 0-10min: bright magenta
+        (10, 20, '#dd44dd', 'mediumorchid'), # 10-20min: medium orchid  
+        (20, 30, '#bb88bb', 'plum'),        # 20-30min: plum
+        (30, 45, '#cc99cc', 'thistle'),     # 30-45min: thistle
+        (45, 60, '#e6d6e6', 'lavender')     # 45-60min: light lavender
+    ]
+    
+    # Process each time range
+    for min_time, max_time, color, color_name in time_ranges:
+        # Filter points for this time range
+        range_points = []
+        for stop_id, data in reachable_points.items():
+            travel_time = data.get('travel_time', float('inf'))
+            if min_time <= travel_time < max_time:
+                lat = data.get('stop_lat')
+                lon = data.get('stop_lon')
+                if lat is not None and lon is not None:
+                    range_points.append((lat, lon))
+        
+        if len(range_points) < 3:
+            console.print(f"[dim]Skipping {min_time}-{max_time}min range: only {len(range_points)} points[/dim]")
+            continue
+        
+        # Create polygon for this time range
+        polygon = points_to_polygon(range_points, alpha=0.1)
+        
+        if polygon and polygon.is_valid:
+            # Convert to GeoDataFrame for Folium
+            gdf = gpd.GeoDataFrame([1], geometry=[polygon], crs="EPSG:4326")
+            
+            # Add polygon to map
+            folium.GeoJson(
+                gdf.geometry.iloc[0],
+                style_function=lambda feature, color=color: {
+                    'fillColor': color,
+                    'color': color,
+                    'weight': 2,
+                    'fillOpacity': 0.3,
+                    'opacity': 0.6
+                },
+                popup=f"Reachable in {min_time}-{max_time} minutes",
+                tooltip=f"{min_time}-{max_time} min"
+            ).add_to(m)
+            
+            console.print(f"[magenta]Added {color_name} zone: {len(range_points)} points ({min_time}-{max_time}min)[/magenta]")
+    
+    # Add individual transit stops as small markers
+    transit_stops = 0
+    for stop_id, data in reachable_points.items():
+        if data.get('type') == 'transit':
+            lat = data.get('stop_lat')
+            lon = data.get('stop_lon') 
+            travel_time = data.get('travel_time', 0)
+            stop_name = data.get('stop_name', f'Stop {stop_id}')
+            
+            if lat is not None and lon is not None:
+                folium.CircleMarker(
+                    [lat, lon],
+                    radius=3,
+                    popup=f"{stop_name}<br>Travel time: {travel_time:.1f} min",
+                    tooltip=f"{stop_name} ({travel_time:.1f}min)",
+                    color='blue',
+                    fillColor='lightblue',
+                    fillOpacity=0.7
+                ).add_to(m)
+                transit_stops += 1
+    
+    console.print(f"[blue]Added {transit_stops} transit stop markers[/blue]")
+    
+    # Add legend
+    legend_html = '''
+    <div style="position: fixed; 
+                bottom: 50px; left: 50px; width: 200px; height: 120px; 
+                background-color: white; border:2px solid grey; z-index:9999; 
+                font-size:14px; padding: 10px
+                ">
+    <p><b>Travel Time Zones</b></p>
+    <p><i class="fa fa-circle" style="color:#ff00ff"></i> 0-10 minutes</p>
+    <p><i class="fa fa-circle" style="color:#dd44dd"></i> 10-20 minutes</p>
+    <p><i class="fa fa-circle" style="color:#bb88bb"></i> 20-30 minutes</p>
+    <p><i class="fa fa-circle" style="color:#cc99cc"></i> 30-45 minutes</p>
+    <p><i class="fa fa-circle" style="color:#e6d6e6"></i> 45-60 minutes</p>
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+    
+    # Save map
+    m.save(output_file)
+    absolute_path = os.path.abspath(output_file)
+    
+    console.print(f"[green]✓ Map saved to: {absolute_path}[/green]")
+    console.print(f"[dim]Open in browser: file://{absolute_path}[/dim]")
+    
+    return absolute_path
+
+
+def create_simple_boundary_map(
+    center_lat: float,
+    center_lon: float,
+    reachable_points: Dict[str, Dict],
+    max_time: int,
+    title: str = "Reachable Area",
+    output_file: str = "boundary_map.html"
+) -> str:
+    """
+    Create a simple map with single boundary polygon for all reachable points.
+    
+    Args:
+        center_lat: Center latitude
+        center_lon: Center longitude
+        reachable_points: Dictionary of reachable stops
+        max_time: Maximum travel time for the boundary
+        title: Map title
+        output_file: Output HTML filename
+    
+    Returns:
+        Path to generated HTML file
+    """
+    console.print(f"[cyan]Creating boundary map for {max_time}-minute reachable area[/cyan]")
+    
+    # Extract all reachable coordinates
+    points = []
+    for stop_id, data in reachable_points.items():
+        lat = data.get('stop_lat')
+        lon = data.get('stop_lon')
+        if lat is not None and lon is not None:
+            points.append((lat, lon))
+    
+    if len(points) < 3:
+        console.print(f"[red]Error: Need at least 3 points, got {len(points)}[/red]")
+        return ""
+    
+    # Create polygon
+    polygon = points_to_polygon(points, alpha=0.05)
+    
+    if not polygon or not polygon.is_valid:
+        console.print("[red]Error: Could not create valid polygon[/red]")
+        return ""
+    
+    # Initialize map
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=11,
+        tiles='OpenStreetMap'
+    )
+    
+    # Add title
+    title_html = f'''
+                 <h3 align="center" style="font-size:16px; margin-top:10px;"><b>{title}</b></h3>
+                 '''
+    m.get_root().html.add_child(folium.Element(title_html))
+    
+    # Add starting point
+    folium.Marker(
+        [center_lat, center_lon],
+        popup="Starting Point",
+        tooltip="Starting Point",
+        icon=folium.Icon(color='red', icon='play')
+    ).add_to(m)
+    
+    # Add boundary polygon
+    gdf = gpd.GeoDataFrame([1], geometry=[polygon], crs="EPSG:4326")
+    
+    folium.GeoJson(
+        gdf.geometry.iloc[0],
+        style_function=lambda feature: {
+            'fillColor': '#ff00ff',
+            'color': '#cc00cc',
+            'weight': 3,
+            'fillOpacity': 0.4,
+            'opacity': 0.8
+        },
+        popup=f"Reachable area within {max_time} minutes",
+        tooltip=f"Reachable in {max_time} minutes"
+    ).add_to(m)
+    
+    # Save map
+    m.save(output_file)
+    absolute_path = os.path.abspath(output_file)
+    
+    console.print(f"[green]✓ Boundary map saved to: {absolute_path}[/green]")
+    console.print(f"[green]✓ Polygon covers {len(points)} reachable points[/green]")
+    console.print(f"[dim]Open in browser: file://{absolute_path}[/dim]")
+    
+    return absolute_path

@@ -51,18 +51,32 @@ uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20  # Coordinate i
 - Only calculate walking connections for stops actually within 500m
 - Remove arbitrary 2000-stop performance limit
 
-### 3. Visualization and Export
+### 3. Visualization and Export ✅ (Completed)
 **Purpose**: Generate visual isochrone maps
 
-- Add `folium` dependency for interactive web maps
-- Generate isochrone polygons:
-  - Convex hull or alpha shapes around reachable points (including walking expansion)
-  - Multiple time rings (15min, 30min, 45min, etc.)
-  - Color coding by travel time
-- Export options:
-  - Interactive HTML map with OpenStreetMap tiles
-  - GeoJSON for use in other mapping tools
-  - Static PNG images
+#### Implemented Features:
+- ✅ **Interactive web maps**: Folium-based with OpenStreetMap tiles
+- ✅ **Alpha shape polygons**: Realistic boundaries around reachable points
+- ✅ **Time-layered visualization**: Color-coded zones (0-10min, 10-20min, 20-30min, etc.)
+- ✅ **CLI integration**: Both standalone and integrated with query command
+- ✅ **Transit stop markers**: Individual stops with travel time information
+- ✅ **Professional styling**: Legend, tooltips, and responsive design
+
+#### Available Commands:
+```bash
+# Standalone visualization
+uv run python main.py visualize --address "Düsseldorf Hbf" --time 30
+
+# Simple boundary mode
+uv run python main.py visualize --lat 51.2197 --lon 6.7943 --time 20 --simple
+
+# Integrated with query
+uv run python main.py query --address "Düsseldorf Hbf" --time 20 --visualize
+```
+
+#### Pending Export Options:
+- GeoJSON export for use in other mapping tools
+- Static PNG image generation
 
 ### 4. Time-Dependent Routing (Future)
 **Purpose**: Use actual schedules instead of simplified wait times
@@ -88,18 +102,26 @@ uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20  # Coordinate i
    - Graph construction ✓
    - Basic isochrone calculation ✓
 
-2. **Phase 2** (In Progress): Enhanced walking model
-   - Multi-origin Dijkstra algorithm
-   - 20-minute walking time budget
-   - End-of-journey walking expansion
-   - Spatial indexing for transfers
+2. **Phase 2** (Completed): Enhanced walking model ✓
+   - Multi-origin Dijkstra algorithm ✓
+   - 20-minute walking time budget ✓
+   - End-of-journey walking expansion ✓
+   - Line coverage optimization ✓
 
-3. **Phase 3**: Visualization and export
-   - Interactive map generation
-   - Isochrone polygon creation
-   - GeoJSON/HTML export
+3. **Phase 3** (Completed): Visualization and export ✓
+   - Interactive map generation ✓
+   - Isochrone polygon creation ✓
+   - HTML export ✓
+   - CLI integration ✓
+   - Color optimization ✓
 
-4. **Phase 4**: Advanced features
+4. **Phase 4** (Current): Bug fixes and improvements ✓
+   - ✅ Walking time calculation fix
+   - ✅ Debug tools for route investigation
+   - ✅ Improved visualization colors (magenta/purple)
+   - 🔍 Investigating missing bus connections
+
+5. **Phase 5**: Advanced features
    - Time-dependent routing
    - Multi-modal integration
    - Real-time data

@@ -19,6 +19,7 @@ import time
 import json
 from datetime import datetime
 import networkx as nx
+from visualization import create_isochrone_map, create_simple_boundary_map
 
 
 console = Console()
@@ -346,7 +347,7 @@ def calculate_multi_origin_isochrone(graph: nx.DiGraph, walkable_stops: List[Dic
 
 
 def add_end_walking_expansion(reachable_stops: Dict[str, Dict], graph: nx.DiGraph, 
-                            max_walk_time_minutes: int = 20) -> Dict[str, Dict]:
+                            max_walk_time_minutes: int = 20, max_total_time_minutes: int = 60) -> Dict[str, Dict]:
     """
     For each transit-reachable stop, add all points within walking distance
     This represents walking from the final transit stop to the destination
@@ -398,24 +399,34 @@ def add_end_walking_expansion(reachable_stops: Dict[str, Dict], graph: nx.DiGrap
                 
                 if walk_distance_km <= max_walk_distance_km:
                     walk_time_minutes = (walk_distance_km / 5.0) * 60
-                    total_time_minutes = stop_info['total_time_minutes'] + walk_time_minutes
                     
-                    point_key = f"walk_{point_lat:.4f}_{point_lon:.4f}"
+                    # BUG FIX: Don't add walking time to total - the time budget should already include it
+                    # The original transit time to reach this stop already accounts for the time budget
+                    # We only add walking destinations that can be reached within the original time limit
                     
-                    # Keep this point if it's better than existing or new
-                    if (point_key not in expanded_points or 
-                        total_time_minutes < expanded_points[point_key]['total_time_minutes']):
+                    # Calculate what the total time would be if we walked to this point
+                    total_time_would_be = stop_info['total_time_minutes'] + walk_time_minutes
+                    
+                    # BUG FIX: Only include walking destinations that fit within the original time budget
+                    # This prevents final walking time from being added on top of the time limit
+                    if total_time_would_be <= max_total_time_minutes:
+                        point_key = f"walk_{point_lat:.4f}_{point_lon:.4f}"
                         
-                        expanded_points[point_key] = {
-                            'total_time_minutes': total_time_minutes,
-                            'point_type': 'walking_destination',
-                            'lat': point_lat,
-                            'lon': point_lon,
-                            'name': f"Walking from {stop_data['name'][:20]}",
-                            'transit_stop_info': stop_info,
-                            'end_walk_time_minutes': walk_time_minutes,
-                            'walk_distance_km': walk_distance_km
-                        }
+                        # Keep this point if it's better than existing or new
+                        if (point_key not in expanded_points or 
+                            total_time_would_be < expanded_points[point_key]['total_time_minutes']):
+                            
+                            expanded_points[point_key] = {
+                                'total_time_minutes': total_time_would_be,  # Store actual total time
+                                'point_type': 'walking_destination',
+                                'lat': point_lat,
+                                'lon': point_lon,
+                                'name': f"Walking from {stop_data['name'][:20]}",
+                                'transit_stop_info': stop_info,
+                                'end_walk_time_minutes': walk_time_minutes,
+                                'walk_distance_km': walk_distance_km,
+                                'transit_time_to_stop': stop_info['total_time_minutes']  # Track transit time separately
+                            }
     
     console.print(f"[green]Expanded to {len(expanded_points)} reachable points (including walking destinations)[/green]")
     return expanded_points
@@ -1064,7 +1075,9 @@ def build_graph(db_path: str, lat: float, lon: float, max_time: int, max_walk: i
 @click.option('--lon', type=float, help='Starting longitude (alternative to address)')
 @click.option('--time', 'max_time', default=30, help='Maximum travel time in minutes')
 @click.option('--departure', default='09:00', help='Departure time (HH:MM format)')
-def query(db_path: str, address: str, lat: float, lon: float, max_time: int, departure: str):
+@click.option('--visualize', is_flag=True, help='Generate interactive map after calculation')
+@click.option('--map-output', default='isochrone_map.html', help='Output HTML file for map (if --visualize)')
+def query(db_path: str, address: str, lat: float, lon: float, max_time: int, departure: str, visualize: bool, map_output: str):
     """Find all stops reachable within the given time from an address or coordinates"""
     
     # Check if database exists
@@ -1140,7 +1153,7 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
         console.print(f"\n[bold green]Found {len(reachable_stops)} reachable stops within {max_time} minutes![/bold green]")
         
         # Add end-of-journey walking expansion
-        expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20)
+        expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time)
         
         console.print(f"[bold green]Total reachable area: {len(expanded_points)} points within {max_time} minutes![/bold green]")
         console.print(f"[dim]Including 20-minute walking at start and end of journey[/dim]")
@@ -1194,7 +1207,289 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
         console.print(f"  Additional walking destinations: {total_walking_dest}")
         console.print(f"  Total reachable area: {len(expanded_points)} points")
         
+        # Generate visualization if requested
+        if visualize:
+            console.print(f"\n[cyan]Generating interactive map visualization...[/cyan]")
+            
+            # Convert to format expected by visualization functions
+            visualization_data = {}
+            for point_id, info in expanded_points.items():
+                # Handle different data structures for transit stops vs walking destinations
+                if info.get('point_type') == 'transit_stop':
+                    lat = info.get('lat') or info.get('stop_lat')
+                    lon = info.get('lon') or info.get('stop_lon')
+                    name = info.get('name') or info.get('stop_name', f'Stop {point_id}')
+                else:
+                    lat = info.get('lat')
+                    lon = info.get('lon')
+                    name = info.get('name', f'Walking point {point_id}')
+                
+                # Only include points with valid coordinates
+                if lat is not None and lon is not None:
+                    visualization_data[point_id] = {
+                        'stop_lat': lat,
+                        'stop_lon': lon, 
+                        'stop_name': name,
+                        'travel_time': info.get('total_time_minutes', 0),
+                        'type': 'transit' if info.get('point_type') == 'transit_stop' else 'walking'
+                    }
+            
+            # Generate map title
+            title = f"Reachable Area within {max_time} minutes"
+            if address:
+                title = f"{title} from {address}"
+            
+            # Create the interactive map
+            map_path = create_isochrone_map(
+                start_lat, start_lon, visualization_data, title, map_output
+            )
+            
+            if map_path:
+                console.print(f"\n[bold green]✓ Interactive map generated![/bold green]")
+                console.print(f"[green]Open in browser: file://{map_path}[/green]")
+            else:
+                console.print("[red]Failed to generate map[/red]")
+        
         console.print(f"\n[dim]Data © OpenStreetMap contributors[/dim]")
+        
+    finally:
+        conn.close()
+
+
+@cli.command()
+@click.option('--db-path', default='oepnv.db', help='Path to SQLite database file')
+@click.option('--route', help='Route number to search for (e.g., "447")')
+@click.option('--stop', help='Stop name to search for')
+@click.option('--address1', help='First address to test connection')
+@click.option('--address2', help='Second address to test connection')
+def debug(db_path: str, route: str, stop: str, address1: str, address2: str):
+    """Debug and investigate route connectivity issues"""
+    
+    if not os.path.exists(db_path):
+        console.print(f"[bold red]Database {db_path} not found. Run 'init' command first.[/bold red]")
+        return
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    try:
+        if route:
+            console.print(f"[cyan]Searching for route/line: {route}[/cyan]")
+            
+            # Search in routes table
+            cursor.execute("""
+                SELECT route_id, route_short_name, route_long_name, route_type 
+                FROM routes 
+                WHERE route_short_name LIKE ? OR route_long_name LIKE ? OR route_id LIKE ?
+            """, (f'%{route}%', f'%{route}%', f'%{route}%'))
+            
+            routes = cursor.fetchall()
+            if routes:
+                console.print(f"[green]Found {len(routes)} matching routes:[/green]")
+                for route_id, short_name, long_name, route_type in routes:
+                    console.print(f"  • {short_name or 'N/A'} - {long_name or 'N/A'} (ID: {route_id}, Type: {route_type})")
+                
+                # For each route, find stops
+                for route_id, short_name, long_name, route_type in routes[:3]:  # Limit to first 3
+                    console.print(f"\n[cyan]Stops for route {short_name or route_id}:[/cyan]")
+                    cursor.execute("""
+                        SELECT DISTINCT s.stop_id, s.stop_name, s.stop_lat, s.stop_lon
+                        FROM stops s
+                        JOIN stop_times st ON s.stop_id = st.stop_id
+                        JOIN trips t ON st.trip_id = t.trip_id
+                        WHERE t.route_id = ?
+                        ORDER BY s.stop_name
+                        LIMIT 10
+                    """, (route_id,))
+                    
+                    route_stops = cursor.fetchall()
+                    for stop_id, stop_name, lat, lon in route_stops:
+                        console.print(f"    {stop_name} ({lat:.4f}, {lon:.4f})")
+                    
+                    if len(route_stops) > 10:
+                        console.print(f"    ... and {len(route_stops) - 10} more stops")
+            else:
+                console.print(f"[yellow]No routes found matching '{route}'[/yellow]")
+        
+        if stop:
+            console.print(f"\n[cyan]Searching for stop: {stop}[/cyan]")
+            cursor.execute("""
+                SELECT stop_id, stop_name, stop_lat, stop_lon 
+                FROM stops 
+                WHERE stop_name LIKE ?
+                ORDER BY stop_name
+                LIMIT 10
+            """, (f'%{stop}%',))
+            
+            stops = cursor.fetchall()
+            if stops:
+                console.print(f"[green]Found {len(stops)} matching stops:[/green]")
+                for stop_id, stop_name, lat, lon in stops:
+                    console.print(f"  • {stop_name} ({lat:.4f}, {lon:.4f}) - ID: {stop_id}")
+            else:
+                console.print(f"[yellow]No stops found matching '{stop}'[/yellow]")
+        
+        if address1 and address2:
+            console.print(f"\n[cyan]Testing connection: {address1} → {address2}[/cyan]")
+            
+            # Geocode both addresses
+            coords1 = geocode_address(address1)
+            coords2 = geocode_address(address2)
+            
+            if coords1 and coords2:
+                lat1, lon1 = coords1
+                lat2, lon2 = coords2
+                
+                # Find closest stops to each address
+                console.print(f"\n[cyan]Finding closest stops to each address...[/cyan]")
+                
+                def find_closest_stops(lat, lon, limit=5):
+                    cursor.execute("""
+                        SELECT stop_id, stop_name, stop_lat, stop_lon,
+                               (({} - stop_lat) * ({} - stop_lat) + ({} - stop_lon) * ({} - stop_lon)) as dist_sq
+                        FROM stops
+                        ORDER BY dist_sq
+                        LIMIT {}
+                    """.format(lat, lat, lon, lon, limit))
+                    return cursor.fetchall()
+                
+                stops1 = find_closest_stops(lat1, lon1)
+                stops2 = find_closest_stops(lat2, lon2)
+                
+                console.print(f"[green]Closest stops to {address1}:[/green]")
+                for stop_id, name, lat, lon, dist_sq in stops1:
+                    distance_km = haversine_distance(lat1, lon1, lat, lon)
+                    console.print(f"  • {name} - {distance_km:.2f}km away")
+                
+                console.print(f"\n[green]Closest stops to {address2}:[/green]")
+                for stop_id, name, lat, lon, dist_sq in stops2:
+                    distance_km = haversine_distance(lat2, lon2, lat, lon)
+                    console.print(f"  • {name} - {distance_km:.2f}km away")
+            else:
+                console.print("[red]Could not geocode one or both addresses[/red]")
+    
+    finally:
+        conn.close()
+
+
+@cli.command()
+@click.option('--db-path', default='oepnv.db', help='Path to SQLite database file')
+@click.option('--address', help='Address to start from')
+@click.option('--lat', type=float, help='Starting latitude (alternative to address)')
+@click.option('--lon', type=float, help='Starting longitude (alternative to address)')
+@click.option('--time', 'max_time', default=30, help='Maximum travel time in minutes')
+@click.option('--output', default='isochrone_map.html', help='Output HTML file name')
+@click.option('--simple', is_flag=True, help='Create simple boundary map instead of time-layered')
+def visualize(db_path: str, address: str, lat: float, lon: float, max_time: int, output: str, simple: bool):
+    """Generate interactive map visualization of reachable areas"""
+    
+    # Check if database exists
+    if not os.path.exists(db_path):
+        console.print(f"[bold red]Database {db_path} not found. Run 'init' command first.[/bold red]")
+        return
+    
+    # Determine starting coordinates
+    start_lat, start_lon = None, None
+    
+    if address:
+        console.print(f"[cyan]Geocoding address: {address}[/cyan]")
+        coords = geocode_address(address)
+        if coords:
+            start_lat, start_lon = coords
+        else:
+            console.print("[red]Could not geocode address. Please provide coordinates instead.[/red]")
+            return
+    elif lat is not None and lon is not None:
+        start_lat, start_lon = lat, lon
+        console.print(f"[cyan]Using coordinates: {start_lat:.6f}, {start_lon:.6f}[/cyan]")
+    else:
+        console.print("[red]Please provide either --address or both --lat and --lon[/red]")
+        return
+    
+    # Connect to database
+    conn = sqlite3.connect(db_path)
+    
+    try:
+        # Calculate isochrone data (reuse logic from query command)
+        console.print(f"\n[cyan]Calculating {max_time}-minute isochrone for visualization...[/cyan]")
+        
+        # Find walkable stops
+        walkable_stops = find_walkable_stops(conn, start_lat, start_lon, max_walk_time_minutes=20)
+        
+        if not walkable_stops:
+            console.print("[yellow]No stops found within 20-minute walk of starting location[/yellow]")
+            return
+        
+        # Optimize walkable stops using line coverage
+        stop_lines_mapping = get_stop_lines_mapping(conn)
+        optimized_walkable_stops = optimize_walkable_stops_by_line_coverage(walkable_stops, stop_lines_mapping)
+        
+        # Build transit graph
+        center_stop = optimized_walkable_stops[0] if optimized_walkable_stops else walkable_stops[0]
+        graph = build_transit_graph(
+            conn, 
+            start_lat=center_stop['stop_lat'], 
+            start_lon=center_stop['stop_lon'],
+            max_time_minutes=max_time,
+            max_walking_distance_m=500
+        )
+        
+        if graph.number_of_nodes() == 0:
+            console.print("[yellow]No reachable stops found for the given parameters[/yellow]")
+            return
+        
+        # Calculate multi-origin isochrone
+        reachable_stops = calculate_multi_origin_isochrone(graph, optimized_walkable_stops, max_time)
+        
+        if not reachable_stops:
+            console.print("[yellow]No stops reachable within time limit[/yellow]")
+            return
+        
+        # Add end-of-journey walking expansion
+        expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time)
+        
+        # Convert to format expected by visualization functions
+        visualization_data = {}
+        for point_id, info in expanded_points.items():
+            # Handle different data structures for transit stops vs walking destinations
+            if info.get('point_type') == 'transit_stop':
+                lat = info.get('lat') or info.get('stop_lat')
+                lon = info.get('lon') or info.get('stop_lon')
+                name = info.get('name') or info.get('stop_name', f'Stop {point_id}')
+            else:
+                lat = info.get('lat')
+                lon = info.get('lon')
+                name = info.get('name', f'Walking point {point_id}')
+            
+            # Only include points with valid coordinates
+            if lat is not None and lon is not None:
+                visualization_data[point_id] = {
+                    'stop_lat': lat,
+                    'stop_lon': lon, 
+                    'stop_name': name,
+                    'travel_time': info.get('total_time_minutes', 0),
+                    'type': 'transit' if info.get('point_type') == 'transit_stop' else 'walking'
+                }
+        
+        # Generate map
+        title = f"Reachable Area within {max_time} minutes"
+        if address:
+            title = f"{title} from {address}"
+        
+        if simple:
+            map_path = create_simple_boundary_map(
+                start_lat, start_lon, visualization_data, max_time, title, output
+            )
+        else:
+            map_path = create_isochrone_map(
+                start_lat, start_lon, visualization_data, title, output
+            )
+        
+        if map_path:
+            console.print(f"\n[bold green]✓ Interactive map generated successfully![/bold green]")
+            console.print(f"[green]Open in browser: file://{map_path}[/green]")
+        else:
+            console.print("[red]Failed to generate map[/red]")
         
     finally:
         conn.close()

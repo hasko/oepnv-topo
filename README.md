@@ -10,6 +10,7 @@ This tool calculates how far you can travel using public transport (buses, train
 
 - **Address geocoding** using OpenStreetMap/Nominatim
 - **Isochrone calculation** - find all stops reachable within time limit
+- **Interactive map visualization** - OpenStreetMap-based maps with transparent overlays
 - **Optimized performance** - smart filtering reduces 34k+ stops to relevant subset
 - **Realistic modeling** - accounts for transfers, waiting times, and walking
 - **Multiple input methods** - address or coordinates
@@ -60,6 +61,22 @@ uv run python main.py stats
 uv run python main.py build-graph --lat 51.2197 --lon 6.7943 --time 30
 ```
 
+### Interactive Map Visualization
+
+```bash
+# Generate standalone interactive map
+uv run python main.py visualize --address "Düsseldorf Hauptbahnhof" --time 30
+
+# Create simple boundary map (single overlay)
+uv run python main.py visualize --lat 51.2197 --lon 6.7943 --time 20 --simple
+
+# Combine query calculation with automatic map generation
+uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 20 --visualize
+
+# Custom output filename
+uv run python main.py visualize --address "Essen Hauptbahnhof" --time 30 --output essen_map.html
+```
+
 ## Data
 
 The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
@@ -94,6 +111,16 @@ The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
 - **Line coverage optimization**: Smart selection of origins to avoid redundancy
 - **Transfer walking**: 500m limit between stops (realistic transfer distance)
 
+### Interactive Visualization Features
+
+- **Time-layered polygons**: Different colored zones for 0-10min, 10-20min, 20-30min travel times
+- **Alpha shapes**: Realistic concave boundaries that handle gaps in coverage
+- **OpenStreetMap integration**: Free base tiles with professional cartographic styling
+- **Interactive HTML output**: Zoomable, pannable maps that work in any browser
+- **Transit stop markers**: Individual stops with travel time popups
+- **Legend and tooltips**: User-friendly interface with clear time zone indicators
+- **Optimized colors**: Magenta/purple color scheme avoids conflicts with green areas on maps
+
 ### Current Limitations
 
 - Uses simplified wait times rather than actual schedule-based routing
@@ -102,7 +129,6 @@ The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
 
 ## Next Steps
 
-- **Visualization**: Generate interactive maps showing isochrone areas
 - **Export options**: GeoJSON, KML for use in mapping applications
 - **Time-dependent routing**: Use actual departure times from schedules
 - **Spatial indexing**: R-tree optimization for walking connections
