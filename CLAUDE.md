@@ -31,77 +31,84 @@ The project uses Python 3.11 with uv for dependency management. Key dependencies
 ## Commands
 
 ```bash
-# Initialize database from GTFS data
+# Initialize database from GTFS data (includes calendar tables)
 uv run python main.py init
 
 # Show database statistics and example queries
 uv run python main.py stats
 
-# Find reachable stops within travel time (isochrone calculation)
+# Find reachable stops using actual GTFS schedules (default: April 7, 2025 at 8am)
 uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30
 uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20
 
-# Build optimized graph for specific location (optional)
-uv run python main.py build-graph --lat 51.2197 --lon 6.7943 --time 30
+# Specify custom date and departure time
+uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --date 20250407 --departure 08:00
 
-# Generate interactive maps with isochrone visualization
+# Generate interactive maps with schedule-based isochrone visualization
+uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30 --visualize
+uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20 --visualize --map-output custom_map.html
+
+# Visualize existing results
 uv run python main.py visualize --address "Düsseldorf Hauptbahnhof" --time 30
-uv run python main.py visualize --lat 51.2197 --lon 6.7943 --time 20 --simple
-
-# Combine query with automatic map generation
-uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 20 --visualize
 ```
 
 ## Key Functions
 
 - `geocode_address()` - OpenStreetMap geocoding with caching
-- `build_transit_graph()` - Optimized graph building with distance/time filtering  
+- `is_service_active_on_date()` - Check if GTFS service runs on specific date using calendar data
+- `get_active_trips_on_date()` - Get all trips running on a specific date
+- `build_time_dependent_graph()` - Build time-expanded graph with actual departure/arrival times
 - `find_walkable_stops()` - Find all stops within 20-minute walk
 - `optimize_walkable_stops_by_line_coverage()` - Line coverage optimization
-- `calculate_multi_origin_isochrone()` - Multi-origin Dijkstra algorithm
-- `add_end_walking_expansion()` - 20-minute walking from transit destinations
+- `calculate_time_dependent_isochrone()` - Schedule-based Dijkstra with actual departure times
+- `add_schedule_based_walking_expansion()` - Walking expansion with circle unions for schedule-based results
 - `haversine_distance()` - Calculate distance between coordinates in km
-- `create_walking_circles_union()` - Generate union polygons from walking circles with remaining time budget
 - `create_circle_union_map()` - Generate interactive maps with precise circular boundaries and line information
 - `get_stop_lines_mapping()` - Extract human-readable line names (447, U43, S1) from GTFS data
 
 ## Implementation Status
 
 ✅ **Completed Core Features:**
-1. ✅ Geocode German addresses using OpenStreetMap/Nominatim
-2. ✅ Build optimized transit graphs from GTFS data
-3. ✅ Enhanced walking model: 20 minutes at start and end of journey
-4. ✅ Line coverage optimization: Smart origin selection (10x speedup)
-5. ✅ Multi-origin isochrone calculation with time budgeting
-6. ✅ End-of-journey walking expansion to destinations
+1. ✅ Schedule-based GTFS routing using actual departure/arrival times
+2. ✅ Calendar support for date-specific service validation
+3. ✅ Time-dependent graph with (stop_id, time) nodes
+4. ✅ Geocode German addresses using OpenStreetMap/Nominatim
+5. ✅ Enhanced walking model: 20 minutes at start and end of journey
+6. ✅ Line coverage optimization: Smart origin selection (10x speedup)
 7. ✅ Interactive map visualization with OpenStreetMap tiles
 8. ✅ Time-layered polygon overlays with realistic boundaries
 
+**Schedule-Based Routing:**
+- Uses actual GTFS stop_times data for precise departure/arrival times
+- Calendar validation: Only includes trips that run on specified date
+- Time-dependent Dijkstra: Finds earliest arrival times respecting schedules
+- Real wait times: Calculates actual waiting at stops based on next departure
+- Default: Monday April 7, 2025 at 8:00 AM (non-holiday weekday)
+
 **Enhanced Walking Model:**
-- Multi-origin Dijkstra from all stops within 20-minute walk
+- Multi-origin routing from all stops within 20-minute walk
 - Line coverage optimization: 320 → 30 origins while covering all 80 lines
-- End walking expansion: 20-minute radius from transit destinations
-- Results: 3,173 reachable points vs ~5 with basic model
+- End walking expansion: Circle unions around transit destinations
+- Time-budgeted walking: Only allows walking within remaining time
 
 **Interactive Visualization Features:**
 - Circle union boundaries: Precise walking areas computed as unions of circles around transit stops
-- Time-layered overlays: Color-coded zones (0-10min, 10-20min, 20-30min, etc.) based on remaining time budget
+- Time-layered overlays: Color-coded zones (0-10min, 10-20min, 20-30min) based on actual arrival times
 - Interactive transit markers: Click/hover stops to see travel times and human-readable line names (447, U43, S1)
+- Schedule information: Shows actual departure times and wait times
 - Accurate geometry: Preserves holes, disconnected areas, and complex shapes
 - Static HTML output: Self-contained files ready for GitHub Pages deployment
-- Professional styling: Legend, tooltips, zoom/pan functionality with responsive design
-- CLI integration: Standalone and integrated with query command
 
 **Performance Optimizations:**
-- Filters 34k+ stops down to ~2-10k based on reachable distance  
-- Line coverage reduces Dijkstra origins by 10.7x
-- Direction filtering: Prevents U-turns, reduces connections by ~46%
-- Route direction tracking: Only uses one direction per route to avoid inefficient back-and-forth
-- Transfer optimization: Uses GTFS transfer data with 5-minute penalties for route changes
-- Detailed progress reporting: Shows stop filtering, connection processing, and graph statistics
-- Caches geocoding results to avoid repeated API calls
+- Calendar filtering: Only processes trips running on specified date
+- Batch processing: Handles large GTFS datasets efficiently
+- Line coverage optimization: Reduces routing origins by 10x
+- Time window filtering: Only builds graph for relevant time periods
+- Transfer optimization: Uses GTFS transfer data with realistic penalties
+- Detailed progress reporting: Shows filtering, processing, and graph statistics
 
-**Next Steps:**
-- Export: Save results as GeoJSON or other map formats
-- Spatial indexing: R-tree optimization for walking connections
-- Time-dependent routing: Use actual departure times from schedules
+**Real-World Accuracy:**
+- **Düsseldorf Hbf**: 771 reachable stops (schedule-based) vs 2,557 (estimates) 
+- **Dortmund TU**: 190 reachable stops (schedule-based) vs 598 (estimates)
+- Average wait times: 1-2 minutes (realistic) vs 0 (theoretical)
+- Respects actual service patterns, holidays, and timetables

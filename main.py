@@ -102,6 +102,80 @@ def geocode_address(address: str, country_code: str = 'de') -> Optional[Tuple[fl
         return None
 
 
+def is_service_active_on_date(conn: sqlite3.Connection, service_id: str, date_str: str) -> bool:
+    """
+    Check if a service is active on a specific date based on calendar and calendar_dates
+    
+    Args:
+        conn: Database connection
+        service_id: Service ID to check
+        date_str: Date in YYYYMMDD format (e.g., '20250407')
+    
+    Returns:
+        True if service is active on this date
+    """
+    cursor = conn.cursor()
+    
+    # First check calendar_dates for exceptions
+    cursor.execute("""
+        SELECT exception_type 
+        FROM calendar_dates 
+        WHERE service_id = ? AND date = ?
+    """, (service_id, date_str))
+    
+    exception = cursor.fetchone()
+    if exception:
+        # exception_type: 1 = service added, 2 = service removed
+        return exception[0] == 1
+    
+    # No exception found, check regular calendar
+    # Parse date to get day of week (0 = Monday, 6 = Sunday)
+    from datetime import datetime
+    date_obj = datetime.strptime(date_str, '%Y%m%d')
+    weekday = date_obj.weekday()
+    
+    # Map weekday to column names
+    day_columns = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+    day_column = day_columns[weekday]
+    
+    # Check if service runs on this day of week and date is within service period
+    query = f"""
+        SELECT {day_column}
+        FROM calendar
+        WHERE service_id = ? 
+          AND start_date <= ?
+          AND end_date >= ?
+    """
+    
+    cursor.execute(query, (service_id, date_str, date_str))
+    result = cursor.fetchone()
+    
+    return bool(result and result[0] == 1)
+
+
+def get_active_trips_on_date(conn: sqlite3.Connection, date_str: str) -> List[str]:
+    """
+    Get all trip IDs that are active on a specific date
+    
+    Args:
+        date_str: Date in YYYYMMDD format (e.g., '20250407')
+    
+    Returns:
+        List of active trip IDs
+    """
+    cursor = conn.cursor()
+    
+    # Get all trips with their service IDs
+    cursor.execute("SELECT trip_id, service_id FROM trips")
+    
+    active_trips = []
+    for trip_id, service_id in cursor.fetchall():
+        if is_service_active_on_date(conn, service_id, date_str):
+            active_trips.append(trip_id)
+    
+    return active_trips
+
+
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
     Calculate the great circle distance between two points 
@@ -286,16 +360,40 @@ def optimize_walkable_stops_by_line_coverage(walkable_stops: List[Dict],
     return selected_stops
 
 
-def calculate_multi_origin_isochrone(graph: nx.DiGraph, walkable_stops: List[Dict], 
-                                   max_total_time_minutes: int) -> Dict[str, Dict]:
+def calculate_time_dependent_isochrone(graph: nx.DiGraph, walkable_stops: List[Dict],
+                                      start_time_seconds: int,
+                                      max_total_time_minutes: int) -> Dict[str, Dict]:
     """
-    Calculate isochrone using multiple starting points (all walkable stops)
-    Returns dict mapping stop_id to best travel info (time, route, etc.)
+    Calculate time-dependent isochrone using actual departure times
+    
+    Args:
+        graph: Time-dependent graph with (stop_id, time) nodes
+        walkable_stops: List of stops reachable by walking from start
+        start_time_seconds: Earliest departure time in seconds since midnight
+        max_total_time_minutes: Maximum total travel time including walking
+    
+    Returns:
+        Dictionary mapping stop_id to travel information
     """
     max_total_time_seconds = max_total_time_minutes * 60
-    best_times = {}  # stop_id -> {total_time, walk_time, transit_time, origin_stop}
+    end_time_seconds = start_time_seconds + max_total_time_seconds
     
-    console.print(f"[cyan]Running multi-origin Dijkstra from {len(walkable_stops)} walkable stops...[/cyan]")
+    console.print(f"[cyan]Running time-dependent routing from {len(walkable_stops)} walkable stops...[/cyan]")
+    console.print(f"[dim]Start time: {seconds_to_time_str(start_time_seconds)}, Max arrival: {seconds_to_time_str(end_time_seconds)}[/dim]")
+    
+    # Track best arrival times for each stop
+    best_arrivals = {}  # stop_id -> {arrival_time, total_time, path_info}
+    
+    # Group graph nodes by stop_id for efficient lookup
+    from collections import defaultdict
+    nodes_by_stop = defaultdict(list)
+    for node in graph.nodes():
+        stop_id, time = node
+        nodes_by_stop[stop_id].append((node, time))
+    
+    # Sort nodes by time for each stop
+    for stop_id in nodes_by_stop:
+        nodes_by_stop[stop_id].sort(key=lambda x: x[1])
     
     with Progress(
         SpinnerColumn(),
@@ -304,54 +402,91 @@ def calculate_multi_origin_isochrone(graph: nx.DiGraph, walkable_stops: List[Dic
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         console=console
     ) as progress:
-        task = progress.add_task("Processing origins...", total=len(walkable_stops))
+        task = progress.add_task("Processing walkable origins...", total=len(walkable_stops))
         
         for walkable_stop in walkable_stops:
             origin_stop_id = walkable_stop['stop_id']
-            walk_time_seconds = walkable_stop['walk_time_minutes'] * 60
-            available_transit_time = max_total_time_seconds - walk_time_seconds
+            walk_time_seconds = int(walkable_stop['walk_time_minutes'] * 60)
             
-            # Skip if walking time alone exceeds total time limit
-            if available_transit_time <= 0:
+            # Calculate when we arrive at the stop after walking
+            arrival_at_stop = start_time_seconds + walk_time_seconds
+            
+            # Skip if walking alone exceeds time limit
+            if arrival_at_stop >= end_time_seconds:
                 progress.update(task, advance=1)
                 continue
             
-            # Skip if this stop is not in the graph
-            if not graph.has_node(origin_stop_id):
+            # Find first departure from this stop after arrival
+            if origin_stop_id not in nodes_by_stop:
                 progress.update(task, advance=1)
                 continue
             
-            # Run Dijkstra from this origin with remaining time budget
+            # Find the earliest departure after we arrive by walking
+            origin_nodes = []
+            for node, node_time in nodes_by_stop[origin_stop_id]:
+                if node_time >= arrival_at_stop:
+                    origin_nodes.append(node)
+                    break  # Only need the first departure
+            
+            if not origin_nodes:
+                progress.update(task, advance=1)
+                continue
+            
+            # Run Dijkstra from this origin with time constraints
+            origin_node = origin_nodes[0]
+            
             try:
-                reachable_from_origin = nx.single_source_dijkstra_path_length(
-                    graph, origin_stop_id, cutoff=available_transit_time, weight='weight'
+                # Calculate shortest paths considering time constraints
+                lengths = nx.single_source_dijkstra_path_length(
+                    graph, origin_node, weight='weight'
                 )
                 
-                # Update best times for each reachable stop
-                for stop_id, transit_time_seconds in reachable_from_origin.items():
-                    total_time_seconds = walk_time_seconds + transit_time_seconds
+                # Process reachable nodes
+                for target_node, transit_time in lengths.items():
+                    target_stop_id, arrival_time = target_node
                     
-                    if total_time_seconds <= max_total_time_seconds:
-                        # Keep this result if it's better than previous best
-                        if (stop_id not in best_times or 
-                            total_time_seconds < best_times[stop_id]['total_time_seconds']):
+                    # Calculate total travel time
+                    wait_time_at_origin = origin_node[1] - arrival_at_stop
+                    total_time_seconds = walk_time_seconds + wait_time_at_origin + transit_time
+                    
+                    # Check if within time limit
+                    if arrival_time <= end_time_seconds and total_time_seconds <= max_total_time_seconds:
+                        # Keep if this is the best arrival at this stop
+                        if (target_stop_id not in best_arrivals or 
+                            arrival_time < best_arrivals[target_stop_id]['arrival_time']):
                             
-                            best_times[stop_id] = {
+                            best_arrivals[target_stop_id] = {
+                                'arrival_time': arrival_time,
+                                'arrival_time_str': seconds_to_time_str(arrival_time),
                                 'total_time_seconds': total_time_seconds,
-                                'walk_time_seconds': walk_time_seconds,
-                                'transit_time_seconds': transit_time_seconds,
-                                'origin_stop': walkable_stop,
                                 'total_time_minutes': total_time_seconds / 60.0,
+                                'walk_time_seconds': walk_time_seconds,
                                 'walk_time_minutes': walk_time_seconds / 60.0,
-                                'transit_time_minutes': transit_time_seconds / 60.0
+                                'wait_time_seconds': wait_time_at_origin,
+                                'wait_time_minutes': wait_time_at_origin / 60.0,
+                                'transit_time_seconds': transit_time,
+                                'transit_time_minutes': transit_time / 60.0,
+                                'origin_stop': walkable_stop,
+                                'departure_time': origin_node[1],
+                                'departure_time_str': seconds_to_time_str(origin_node[1])
                             }
             except:
-                # Skip problematic origins
+                # Skip if no paths found
                 pass
             
             progress.update(task, advance=1)
     
-    return best_times
+    console.print(f"[green]Found {len(best_arrivals)} reachable stops using schedule-based routing[/green]")
+    
+    # Show some statistics
+    if best_arrivals:
+        avg_wait = sum(s['wait_time_minutes'] for s in best_arrivals.values()) / len(best_arrivals)
+        max_wait = max(s['wait_time_minutes'] for s in best_arrivals.values())
+        console.print(f"[dim]Average wait time: {avg_wait:.1f} min, Max wait: {max_wait:.1f} min[/dim]")
+    
+    return best_arrivals
+
+
 
 
 def create_walking_circles_union(reachable_stops: Dict[str, Dict], graph: nx.DiGraph,
@@ -540,6 +675,118 @@ def union_polygons_to_points(union_polygons: Dict[str, Polygon], reachable_stops
     return expanded_points
 
 
+def add_schedule_based_walking_expansion(reachable_stops: Dict[str, Dict], conn: sqlite3.Connection,
+                                       stop_lines_mapping: Dict[str, set],
+                                       max_walk_time_minutes: int = 20, max_total_time_minutes: int = 60) -> Tuple[Dict[str, Dict], Dict[str, Polygon]]:
+    """
+    Add walking expansion for schedule-based routing results with circle unions
+    """
+    expanded_points = {}
+    cursor = conn.cursor()
+    
+    console.print(f"[cyan]Adding end-of-journey walking expansion for schedule-based results...[/cyan]")
+    
+    # Get stop coordinates from database
+    stop_coords = {}
+    cursor.execute("SELECT stop_id, stop_lat, stop_lon, stop_name FROM stops")
+    for stop_id, lat, lon, name in cursor.fetchall():
+        stop_coords[stop_id] = {'lat': lat, 'lon': lon, 'name': name}
+    
+    # Create walking circles for union computation
+    from shapely.geometry import Point
+    from shapely.ops import unary_union
+    import pyproj
+    
+    # Set up coordinate transformation
+    central_lat = sum(stop_coords[s]['lat'] for s in reachable_stops if s in stop_coords) / len(reachable_stops)
+    central_lon = sum(stop_coords[s]['lon'] for s in reachable_stops if s in stop_coords) / len(reachable_stops)
+    
+    utm_zone = int((central_lon + 180) / 6) + 1
+    utm_crs = f"EPSG:{32600 + utm_zone}"
+    
+    wgs84_to_utm = pyproj.Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+    utm_to_wgs84 = pyproj.Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
+    
+    # Group circles by time ranges
+    time_ranges = [
+        (0, 10, 'very_close'),
+        (10, 20, 'close'), 
+        (20, 30, 'medium'),
+        (30, 45, 'far'),
+        (45, 60, 'very_far')
+    ]
+    
+    circles_by_range = {name: [] for _, _, name in time_ranges}
+    
+    # Process each reachable stop
+    for stop_id, stop_info in reachable_stops.items():
+        if stop_id not in stop_coords:
+            continue
+            
+        stop_data = stop_coords[stop_id]
+        
+        # Add the stop itself
+        point_key = f"stop_{stop_id}"
+        expanded_points[point_key] = {
+            **stop_info,
+            'point_type': 'transit_stop',
+            'lat': stop_data['lat'],
+            'lon': stop_data['lon'],
+            'name': stop_data['name'],
+            'stop_lat': stop_data['lat'],
+            'stop_lon': stop_data['lon'],
+            'stop_name': stop_data['name'],
+            'lines': list(stop_lines_mapping.get(stop_id, set()))  # Add line information
+        }
+        
+        # Calculate remaining time for walking and create circle
+        transit_time = stop_info['total_time_minutes']
+        remaining_time = max_total_time_minutes - transit_time
+        
+        if remaining_time > 0:
+            # Calculate walking radius
+            available_walk_time = min(remaining_time, max_walk_time_minutes)
+            walk_radius_km = (available_walk_time / 60.0) * 5.0
+            walk_radius_meters = walk_radius_km * 1000
+            
+            # Transform stop coordinates to UTM for accurate buffering
+            utm_x, utm_y = wgs84_to_utm.transform(stop_data['lon'], stop_data['lat'])
+            
+            # Create circle in UTM coordinates
+            stop_point_utm = Point(utm_x, utm_y)
+            circle_utm = stop_point_utm.buffer(walk_radius_meters)
+            
+            # Transform circle back to WGS84
+            circle_wgs84 = transform(utm_to_wgs84.transform, circle_utm)
+            
+            # Determine which time range this stop belongs to
+            for min_time, max_time, range_name in time_ranges:
+                if min_time <= transit_time < max_time:
+                    circles_by_range[range_name].append(circle_wgs84)
+                    break
+    
+    # Compute union for each time range
+    union_polygons = {}
+    total_circles = sum(len(circles) for circles in circles_by_range.values())
+    console.print(f"[dim]Computing unions for {total_circles} walking circles across {len(time_ranges)} time ranges[/dim]")
+    
+    for range_name, circles in circles_by_range.items():
+        if circles:
+            console.print(f"[dim]Computing union for {len(circles)} circles in {range_name} range[/dim]")
+            union_poly = unary_union(circles)
+            union_polygons[range_name] = union_poly
+            
+            # Calculate area for reporting
+            if hasattr(union_poly, 'area'):
+                area_approx = union_poly.area * 111.0 * 111.0  # Rough conversion to km²
+                console.print(f"[green]✓ {range_name}: {len(circles)} circles → {area_approx:.1f} km² union[/green]")
+    
+    console.print(f"[green]Created {len(union_polygons)} time-based walking area unions[/green]")
+    console.print(f"[green]Expanded to {len(expanded_points)} transit stops with line information[/green]")
+    
+    return expanded_points, union_polygons
+
+
 def add_end_walking_expansion(reachable_stops: Dict[str, Dict], graph: nx.DiGraph, 
                             max_walk_time_minutes: int = 20, max_total_time_minutes: int = 60, 
                             use_circle_unions: bool = False, return_polygons: bool = False) -> Union[Dict[str, Dict], Tuple[Dict[str, Dict], Dict[str, Polygon]]]:
@@ -643,255 +890,272 @@ def add_end_walking_expansion(reachable_stops: Dict[str, Dict], graph: nx.DiGrap
     return expanded_points
 
 
-def build_transit_graph(conn: sqlite3.Connection, 
-                       start_lat: float, start_lon: float, 
-                       max_time_minutes: int = 30,
-                       max_walking_distance_m: int = 500) -> nx.DiGraph:
+def parse_gtfs_time(time_str: str) -> int:
     """
-    Build a directed graph representing the transit network
-    
-    Nodes: stops with attributes (lat, lon, name)
-    Edges: connections with weights representing travel time in seconds
-    
-    Optimized for a specific starting location and maximum travel time
+    Parse GTFS time format (HH:MM:SS) to seconds since midnight
+    Handles times > 24:00:00 for trips that span midnight
     """
-    # Calculate maximum reachable distance (assuming 50 km/h max speed)
+    hours, mins, secs = map(int, time_str.split(':'))
+    return hours * 3600 + mins * 60 + secs
+
+
+def seconds_to_time_str(seconds: int) -> str:
+    """Convert seconds since midnight to HH:MM:SS format"""
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+
+def build_time_dependent_graph(conn: sqlite3.Connection, 
+                              start_lat: float, start_lon: float,
+                              date_str: str,
+                              start_time_seconds: int,
+                              max_time_minutes: int = 30,
+                              max_walking_distance_m: int = 500) -> nx.DiGraph:
+    """
+    Build a time-dependent transit graph using actual GTFS schedules
+    
+    Args:
+        conn: Database connection
+        start_lat, start_lon: Starting coordinates
+        date_str: Date in YYYYMMDD format (e.g., '20250407')
+        start_time_seconds: Start time in seconds since midnight (e.g., 28800 for 8:00 AM)
+        max_time_minutes: Maximum travel time in minutes
+        max_walking_distance_m: Maximum walking distance between stops
+    
+    Returns:
+        Time-dependent directed graph where nodes are (stop_id, arrival_time) tuples
+    """
+    # Calculate time window
+    end_time_seconds = start_time_seconds + (max_time_minutes * 60)
     max_distance_km = (max_time_minutes / 60.0) * 50
-    max_stops_per_trip = max_time_minutes  # 1 stop per minute maximum
     
-    console.print(f"[cyan]Building optimized transit network graph...[/cyan]")
-    console.print(f"[dim]Start: {start_lat:.4f}, {start_lon:.4f}[/dim]")
-    console.print(f"[dim]Max time: {max_time_minutes}min, Max distance: {max_distance_km:.1f}km[/dim]")
-    console.print(f"[dim]Max stops per trip: {max_stops_per_trip}[/dim]")
+    console.print(f"[cyan]Building time-dependent transit graph for {date_str}[/cyan]")
+    console.print(f"[dim]Time window: {seconds_to_time_str(start_time_seconds)} - {seconds_to_time_str(end_time_seconds)}[/dim]")
+    console.print(f"[dim]Max distance: {max_distance_km:.1f}km[/dim]")
     
     G = nx.DiGraph()
     cursor = conn.cursor()
     
-    # Add only reachable stops as nodes
-    console.print("[cyan]Adding reachable stops as nodes...[/cyan]")
+    # Get active trips for this date
+    console.print("[cyan]Finding active trips for the date...[/cyan]")
+    active_trips = get_active_trips_on_date(conn, date_str)
+    console.print(f"[green]Found {len(active_trips):,} active trips on {date_str}[/green]")
+    
+    if not active_trips:
+        console.print("[yellow]No active trips found for this date[/yellow]")
+        return G
+    
+    # Add reachable stops as base nodes
+    console.print("[cyan]Adding reachable stops...[/cyan]")
     cursor.execute("SELECT stop_id, stop_name, stop_lat, stop_lon FROM stops")
     
-    reachable_stops = []
+    reachable_stops = {}
     for stop_id, stop_name, stop_lat, stop_lon in cursor.fetchall():
         distance_km = haversine_distance(start_lat, start_lon, stop_lat, stop_lon)
         
         if distance_km <= max_distance_km:
-            G.add_node(stop_id, 
-                      name=stop_name, 
-                      lat=stop_lat, 
-                      lon=stop_lon,
-                      distance_from_start=distance_km)
-            reachable_stops.append(stop_id)
+            reachable_stops[stop_id] = {
+                'name': stop_name,
+                'lat': stop_lat,
+                'lon': stop_lon,
+                'distance_from_start': distance_km
+            }
     
-    total_stops_count = cursor.execute("SELECT COUNT(*) FROM stops").fetchone()[0]
-    console.print(f"[green]Added {G.number_of_nodes():,} reachable stops (filtered from {total_stops_count:,} total)[/green]")
+    console.print(f"[green]Found {len(reachable_stops):,} reachable stops[/green]")
     
-    # Add transit connections from stop_times
-    console.print("[cyan]Adding transit connections...[/cyan]")
-    console.print(f"[dim]Querying connections between {len(reachable_stops):,} stops...[/dim]")
+    # Build time-expanded nodes and edges from stop_times
+    console.print("[cyan]Building time-expanded graph from schedules...[/cyan]")
     
-    # Skip if no reachable stops found
-    if not reachable_stops:
-        console.print("[yellow]No reachable stops found within distance limit[/yellow]")
-        return G
+    # Process active trips in batches to avoid SQL query length limits
+    batch_size = 500
+    all_stop_times_data = []
+    reachable_stops_str = "'" + "','".join(reachable_stops.keys()) + "'"
     
-    # Create a temporary table with reachable stops for faster filtering
-    reachable_stops_str = "'" + "','".join(reachable_stops) + "'"
+    for i in range(0, len(active_trips), batch_size):
+        batch_trips = active_trips[i:i+batch_size]
+        trip_list = "'" + "','".join(batch_trips) + "'"
+        
+        # Query to get all stop times for active trips within time window
+        query = f"""
+        WITH trip_stops AS (
+            SELECT 
+                st.trip_id,
+                st.stop_id,
+                st.stop_sequence,
+                st.arrival_time,
+                st.departure_time,
+                t.route_id
+            FROM stop_times st
+            JOIN trips t ON st.trip_id = t.trip_id
+            WHERE st.trip_id IN ({trip_list})
+              AND st.stop_id IN ({reachable_stops_str})
+              AND st.departure_time IS NOT NULL
+              AND st.arrival_time IS NOT NULL
+            ORDER BY st.trip_id, st.stop_sequence
+        )
+        SELECT * FROM trip_stops
+        """
+        
+        cursor.execute(query)
+        all_stop_times_data.extend(cursor.fetchall())
     
-    # Query to get consecutive stops on each trip with times, filtered by reachable stops
-    # Include route and direction info to prevent U-turns
-    query = f"""
-    WITH consecutive_stops AS (
-        SELECT 
-            st1.trip_id,
-            t.route_id,
-            t.direction_id,
-            st1.stop_id as from_stop,
-            st2.stop_id as to_stop,
-            st1.departure_time,
-            st2.arrival_time,
-            st1.stop_sequence,
-            st2.stop_sequence as next_sequence
-        FROM stop_times st1
-        JOIN stop_times st2 ON st1.trip_id = st2.trip_id 
-                           AND st2.stop_sequence = st1.stop_sequence + 1
-        JOIN trips t ON st1.trip_id = t.trip_id
-        WHERE st1.departure_time IS NOT NULL 
-          AND st2.arrival_time IS NOT NULL
-          AND st1.departure_time != ''
-          AND st2.arrival_time != ''
-          AND st1.stop_id IN ({reachable_stops_str})
-          AND st2.stop_id IN ({reachable_stops_str})
-          AND st1.stop_sequence <= {max_stops_per_trip}
-          AND st2.stop_sequence <= {max_stops_per_trip}
-    )
-    SELECT from_stop, to_stop, departure_time, arrival_time, route_id, direction_id, COUNT(*) as frequency
-    FROM consecutive_stops
-    GROUP BY from_stop, to_stop, departure_time, arrival_time, route_id, direction_id
-    """
+    console.print(f"[dim]Loaded {len(all_stop_times_data):,} stop time records[/dim]")
+    stop_times_data = all_stop_times_data
     
-    # Process in chunks to handle large dataset
+    # Group by trip_id for processing
+    from collections import defaultdict
+    trips_data = defaultdict(list)
+    for row in stop_times_data:
+        trip_id, stop_id, stop_seq, arr_time, dep_time, route_id = row
+        trips_data[trip_id].append({
+            'stop_id': stop_id,
+            'stop_sequence': stop_seq,
+            'arrival_time': arr_time,
+            'departure_time': dep_time,
+            'route_id': route_id
+        })
+    
+    # Process each trip
+    node_count = 0
+    edge_count = 0
+    
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         console=console
     ) as progress:
-        task = progress.add_task("Processing transit connections...")
+        task = progress.add_task("Processing trips...", total=len(trips_data))
         
-        cursor.execute(query)
-        all_rows = cursor.fetchall()
-        total_raw_connections = len(all_rows)
-        console.print(f"[dim]Found {total_raw_connections:,} raw transit connections to process[/dim]")
-        
-        connection_count = 0
-        skipped_opposite_direction = 0
-        route_directions_used = {}  # Track which direction we've used for each route
-        
-        for i, row in enumerate(all_rows):
-            from_stop, to_stop, dep_time, arr_time, route_id, direction_id, frequency = row
+        for trip_id, stops in trips_data.items():
+            # Sort by stop sequence
+            stops.sort(key=lambda x: x['stop_sequence'])
             
-            try:
-                # Parse times (format: HH:MM:SS)
-                dep_hours, dep_mins, dep_secs = map(int, dep_time.split(':'))
-                arr_hours, arr_mins, arr_secs = map(int, arr_time.split(':'))
+            # Add nodes and edges for consecutive stops
+            for i in range(len(stops) - 1):
+                curr_stop = stops[i]
+                next_stop = stops[i + 1]
                 
-                dep_seconds = dep_hours * 3600 + dep_mins * 60 + dep_secs
-                arr_seconds = arr_hours * 3600 + arr_mins * 60 + arr_secs
+                # Parse times
+                dep_time = parse_gtfs_time(curr_stop['departure_time'])
+                arr_time = parse_gtfs_time(next_stop['arrival_time'])
                 
-                # Handle day overflow (times > 24:00:00)
-                if arr_seconds < dep_seconds:
-                    arr_seconds += 24 * 3600
+                # Skip if outside time window
+                if dep_time < start_time_seconds or arr_time > end_time_seconds:
+                    continue
                 
-                travel_time = arr_seconds - dep_seconds
+                # Create time-expanded nodes
+                dep_node = (curr_stop['stop_id'], dep_time)
+                arr_node = (next_stop['stop_id'], arr_time)
                 
-                # Only add positive travel times
+                # Add nodes with attributes
+                if dep_node not in G:
+                    stop_info = reachable_stops[curr_stop['stop_id']]
+                    G.add_node(dep_node, 
+                              stop_name=stop_info['name'],
+                              lat=stop_info['lat'],
+                              lon=stop_info['lon'],
+                              time=dep_time)
+                    node_count += 1
+                
+                if arr_node not in G:
+                    stop_info = reachable_stops[next_stop['stop_id']]
+                    G.add_node(arr_node,
+                              stop_name=stop_info['name'],
+                              lat=stop_info['lat'],
+                              lon=stop_info['lon'],
+                              time=arr_time)
+                    node_count += 1
+                
+                # Add edge representing vehicle travel
+                travel_time = arr_time - dep_time
                 if travel_time > 0:
-                    # Check if we should use this route direction to prevent U-turns
-                    route_key = route_id
-                    should_add_edge = True
-                    
-                    if route_key in route_directions_used:
-                        # If we've already used this route, only allow same direction
-                        if route_directions_used[route_key] != direction_id:
-                            should_add_edge = False
-                            skipped_opposite_direction += 1
-                    else:
-                        # First time seeing this route, record the direction
-                        route_directions_used[route_key] = direction_id
-                    
-                    if should_add_edge:
-                        # BUG FIX: No wait time for consecutive stops on same route
-                        # You're already on the vehicle, so only travel time applies
-                        wait_time = 0
-                        total_time = travel_time  # Only actual travel time
-                        
-                        # Add edge if both stops exist in graph
-                        if G.has_node(from_stop) and G.has_node(to_stop):
-                            G.add_edge(from_stop, to_stop, 
-                                     weight=total_time,
-                                     travel_time=travel_time,
-                                     wait_time=wait_time,
-                                     frequency=frequency,
-                                     route_id=route_id,
-                                     direction_id=direction_id,
-                                     type='transit')
-                            connection_count += 1
-                        
-            except (ValueError, AttributeError):
-                # Skip malformed time entries
-                continue
-                
-            if (i + 1) % 10000 == 0:
-                progress.update(task, description=f"Processed {i+1:,}/{total_raw_connections:,} rows, added {connection_count:,} connections...")
+                    G.add_edge(dep_node, arr_node,
+                              weight=travel_time,
+                              trip_id=trip_id,
+                              route_id=curr_stop['route_id'],
+                              type='transit')
+                    edge_count += 1
+            
+            progress.update(task, advance=1)
     
-    console.print(f"[green]Added {connection_count:,} transit connections[/green]")
-    console.print(f"[dim]Skipped {skipped_opposite_direction:,} connections in opposite directions to prevent U-turns[/dim]")
-    console.print(f"[dim]Used {len(route_directions_used):,} unique routes[/dim]")
+    console.print(f"[green]Added {node_count:,} time-expanded nodes and {edge_count:,} transit edges[/green]")
     
-    # Add transfer connections from transfers.csv data
-    console.print(f"[cyan]Adding transfer connections from GTFS transfers data...[/cyan]")
-    
-    transfer_query = f"""
-    SELECT from_stop_id, to_stop_id, min_transfer_time
-    FROM transfers
-    WHERE from_stop_id IN ({reachable_stops_str})
-      AND to_stop_id IN ({reachable_stops_str})
-      AND from_stop_id != to_stop_id
-    """
-    
-    cursor.execute(transfer_query)
-    transfer_rows = cursor.fetchall()
-    console.print(f"[dim]Found {len(transfer_rows):,} potential transfer connections to process[/dim]")
-    
+    # Add transfer/waiting edges at stops
+    console.print("[cyan]Adding transfer and waiting edges...[/cyan]")
     transfer_count = 0
     
-    for from_stop, to_stop, min_transfer_time in transfer_rows:
-        if G.has_node(from_stop) and G.has_node(to_stop):
-            # Convert transfer time to int and add 5-minute penalty for route change
-            transfer_penalty = 300  # 5 minutes in seconds
-            min_transfer_seconds = int(min_transfer_time) if min_transfer_time else 0
-            total_transfer_time = min_transfer_seconds + transfer_penalty
+    # Group nodes by stop_id
+    nodes_by_stop = defaultdict(list)
+    for node in G.nodes():
+        stop_id, time = node
+        nodes_by_stop[stop_id].append((node, time))
+    
+    # Add waiting/transfer edges within each stop
+    for stop_id, nodes in nodes_by_stop.items():
+        # Sort by time
+        nodes.sort(key=lambda x: x[1])
+        
+        # Connect each arrival to subsequent departures at the same stop
+        for i in range(len(nodes)):
+            curr_node, curr_time = nodes[i]
             
-            G.add_edge(from_stop, to_stop,
-                     weight=total_transfer_time,
-                     travel_time=min_transfer_seconds,
-                     wait_time=transfer_penalty,
-                     frequency=1,
-                     type='transfer')
-            transfer_count += 1
-    
-    console.print(f"[green]Added {transfer_count:,} transfer connections[/green]")
-    
-    # Add walking connections between nearby stops (only among reachable stops)
-    console.print(f"[cyan]Adding walking connections (max {max_walking_distance_m}m)...[/cyan]")
-    
-    walking_connections = 0
-    stops_list = list(G.nodes(data=True))
-    total_possible_pairs = len(stops_list) * (len(stops_list) - 1) // 2
-    console.print(f"[dim]Checking {len(stops_list):,} stops for walking connections ({total_possible_pairs:,} possible pairs)[/dim]")
-    
-    # Only process walking connections if we have a reasonable number of stops
-    if len(stops_list) > 2000:
-        console.print(f"[yellow]Skipping walking connections due to large number of stops ({len(stops_list):,})[/yellow]")
-        console.print("[dim]Consider reducing max distance or time to enable walking connections[/dim]")
-    else:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            console=console
-        ) as progress:
-            task = progress.add_task("Adding walking connections...", total=len(stops_list))
-            
-            for i, (stop1_id, stop1_data) in enumerate(stops_list):
-                for stop2_id, stop2_data in stops_list[i+1:]:
-                    distance_m = haversine_distance(
-                        stop1_data['lat'], stop1_data['lon'],
-                        stop2_data['lat'], stop2_data['lon']
-                    ) * 1000
-                    
-                    if distance_m <= max_walking_distance_m:
-                        # Walking speed: ~5 km/h = ~1.4 m/s
-                        walk_time = distance_m / 1.4
-                        
-                        # Add bidirectional walking edges
-                        G.add_edge(stop1_id, stop2_id, 
-                                 weight=walk_time,
-                                 distance_m=distance_m,
-                                 type='walking')
-                        G.add_edge(stop2_id, stop1_id, 
-                                 weight=walk_time,
-                                 distance_m=distance_m,
-                                 type='walking')
-                        walking_connections += 2
+            # Look for next departures from this stop
+            for j in range(i + 1, len(nodes)):
+                next_node, next_time = nodes[j]
                 
-                progress.update(task, advance=1)
+                # Minimum transfer time (2 minutes)
+                if next_time >= curr_time + 120:
+                    wait_time = next_time - curr_time
+                    
+                    # Only add reasonable waiting times (up to 30 minutes)
+                    if wait_time <= 1800:
+                        G.add_edge(curr_node, next_node,
+                                  weight=wait_time,
+                                  type='wait',
+                                  stop_id=stop_id)
+                        transfer_count += 1
     
-    console.print(f"[green]Added {walking_connections:,} walking connections[/green]")
-    console.print(f"[bold green]Graph completed: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges[/bold green]")
+    console.print(f"[green]Added {transfer_count:,} transfer/waiting edges[/green]")
+    
+    # Add transfers between nearby stops
+    console.print("[cyan]Adding walking transfers between nearby stops...[/cyan]")
+    walking_transfers = 0
+    
+    # Get transfer data from GTFS
+    cursor.execute(f"""
+        SELECT from_stop_id, to_stop_id, min_transfer_time
+        FROM transfers
+        WHERE from_stop_id IN ({reachable_stops_str})
+          AND to_stop_id IN ({reachable_stops_str})
+          AND from_stop_id != to_stop_id
+    """)
+    
+    for from_stop, to_stop, min_transfer_time in cursor.fetchall():
+        if from_stop in nodes_by_stop and to_stop in nodes_by_stop:
+            transfer_time = int(min_transfer_time) if min_transfer_time else 300  # Default 5 minutes
+            
+            # Connect arrivals at from_stop to departures at to_stop
+            for from_node, from_time in nodes_by_stop[from_stop]:
+                for to_node, to_time in nodes_by_stop[to_stop]:
+                    # Check if transfer is possible (arrival + transfer time <= departure)
+                    if from_time + transfer_time <= to_time <= from_time + 1800:  # Max 30 min transfer
+                        wait_time = to_time - from_time
+                        G.add_edge(from_node, to_node,
+                                  weight=wait_time,
+                                  type='transfer',
+                                  transfer_time=transfer_time)
+                        walking_transfers += 1
+    
+    console.print(f"[green]Added {walking_transfers:,} walking transfer edges[/green]")
+    console.print(f"[bold green]Time-dependent graph completed: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges[/bold green]")
     
     return G
+
+
 
 
 def save_graph(graph: nx.DiGraph, filename: str = "transit_graph.gpickle"):
@@ -1087,10 +1351,39 @@ def create_schema(cursor: sqlite3.Cursor):
         )
     """)
     
+    # Calendar table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS calendar (
+            service_id TEXT PRIMARY KEY,
+            monday INTEGER NOT NULL,
+            tuesday INTEGER NOT NULL,
+            wednesday INTEGER NOT NULL,
+            thursday INTEGER NOT NULL,
+            friday INTEGER NOT NULL,
+            saturday INTEGER NOT NULL,
+            sunday INTEGER NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL
+        )
+    """)
+    
+    # Calendar dates table (exceptions)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS calendar_dates (
+            service_id TEXT NOT NULL,
+            date TEXT NOT NULL,
+            exception_type INTEGER NOT NULL,
+            PRIMARY KEY (service_id, date),
+            FOREIGN KEY (service_id) REFERENCES calendar(service_id)
+        )
+    """)
+    
     # Create indexes for better query performance
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stops_lat_lon ON stops(stop_lat, stop_lon)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times(stop_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trips_route_id ON trips(route_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_calendar_dates_date ON calendar_dates(date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trips_service_id ON trips(service_id)")
     
     console.print("[green]Schema created successfully[/green]")
 
@@ -1107,6 +1400,8 @@ def import_gtfs_data(conn: sqlite3.Connection, data_dir: str) -> Dict[str, int]:
         ('trips.csv', 'trips', ',', 'utf-8'),
         ('stop_times.csv', 'stop_times', ',', 'utf-8'),
         ('transfers.csv', 'transfers', ',', 'utf-8'),
+        ('calendar.csv', 'calendar', ',', 'utf-8'),
+        ('calendar_dates.csv', 'calendar_dates', ',', 'utf-8'),
         ('haltestellen.csv', 'haltestellen', ';', 'latin-1'),
         ('linien.csv', 'linien', ';', 'latin-1'),
     ]
@@ -1351,10 +1646,11 @@ def build_graph(db_path: str, lat: float, lon: float, max_time: int, max_walk: i
 @click.option('--lat', type=float, help='Starting latitude (alternative to address)')
 @click.option('--lon', type=float, help='Starting longitude (alternative to address)')
 @click.option('--time', 'max_time', default=30, help='Maximum travel time in minutes')
-@click.option('--departure', default='09:00', help='Departure time (HH:MM format)')
+@click.option('--date', default='20250407', help='Travel date (YYYYMMDD format, default: April 7, 2025 - Monday)')
+@click.option('--departure', default='08:00', help='Departure time (HH:MM format)')
 @click.option('--visualize', is_flag=True, help='Generate interactive map after calculation')
 @click.option('--map-output', default='isochrone_map.html', help='Output HTML file for map (if --visualize)')
-def query(db_path: str, address: str, lat: float, lon: float, max_time: int, departure: str, visualize: bool, map_output: str):
+def query(db_path: str, address: str, lat: float, lon: float, max_time: int, date: str, departure: str, visualize: bool, map_output: str):
     """Find all stops reachable within the given time from an address or coordinates"""
     
     # Check if database exists
@@ -1400,28 +1696,45 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
         stop_lines_mapping = get_stop_lines_mapping(conn)
         optimized_walkable_stops = optimize_walkable_stops_by_line_coverage(walkable_stops, stop_lines_mapping)
         
-        # Build optimized graph that includes all potentially reachable stops
-        console.print(f"\n[cyan]Building transit graph for {max_time}-minute isochrone...[/cyan]")
+        # Use schedule-based routing with actual GTFS times
+        console.print(f"\n[bold cyan]Using schedule-based routing for {date}[/bold cyan]")
         
-        # Use the closest optimized stop as the center for graph filtering
-        center_stop = optimized_walkable_stops[0] if optimized_walkable_stops else walkable_stops[0]
-        graph = build_transit_graph(
-            conn, 
-            start_lat=center_stop['stop_lat'], 
-            start_lon=center_stop['stop_lon'],
+        # Parse departure time
+        dep_hours, dep_mins = map(int, departure.split(':'))
+        start_time_seconds = dep_hours * 3600 + dep_mins * 60
+        
+        # Validate date
+        from datetime import datetime
+        try:
+            date_obj = datetime.strptime(date, '%Y%m%d')
+            console.print(f"[dim]Date: {date_obj.strftime('%A, %B %d, %Y')}[/dim]")
+            console.print(f"[dim]Departure: {departure} ({start_time_seconds} seconds since midnight)[/dim]")
+        except:
+            console.print(f"[red]Invalid date format: {date}. Use YYYYMMDD format.[/red]")
+            return
+        
+        # Build time-dependent graph
+        console.print(f"\n[cyan]Building time-dependent transit graph...[/cyan]")
+        graph = build_time_dependent_graph(
+            conn,
+            start_lat=start_lat,
+            start_lon=start_lon,
+            date_str=date,
+            start_time_seconds=start_time_seconds,
             max_time_minutes=max_time,
             max_walking_distance_m=500
         )
         
         if graph.number_of_nodes() == 0:
             console.print("[yellow]No reachable stops found for the given parameters[/yellow]")
+            console.print("[dim]This might be because no services run on this date/time[/dim]")
             return
         
-        # Calculate multi-origin isochrone
-        console.print(f"\n[cyan]Calculating isochrone with enhanced walking model...[/cyan]")
-        console.print(f"[dim]Maximum walking time: 20 minutes at start and end of journey[/dim]")
-        
-        reachable_stops = calculate_multi_origin_isochrone(graph, optimized_walkable_stops, max_time)
+        # Calculate time-dependent isochrone
+        console.print(f"\n[cyan]Calculating schedule-based isochrone...[/cyan]")
+        reachable_stops = calculate_time_dependent_isochrone(
+            graph, optimized_walkable_stops, start_time_seconds, max_time
+        )
         
         if not reachable_stops:
             console.print("[yellow]No stops reachable within time limit[/yellow]")
@@ -1429,13 +1742,10 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
         
         console.print(f"\n[bold green]Found {len(reachable_stops)} reachable stops within {max_time} minutes![/bold green]")
         
-        # Add end-of-journey walking expansion using circle union approach
-        if visualize:
-            # Get both points and polygons for circle union visualization
-            expanded_points, union_polygons = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time, use_circle_unions=True, return_polygons=True)
-        else:
-            # Get just points for regular processing
-            expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time, use_circle_unions=True)
+        # Add end-of-journey walking expansion using circle unions
+        expanded_points, union_polygons = add_schedule_based_walking_expansion(
+            reachable_stops, conn, stop_lines_mapping, max_walk_time_minutes=20, max_total_time_minutes=max_time
+        )
         
         console.print(f"[bold green]Total reachable area: {len(expanded_points)} points within {max_time} minutes![/bold green]")
         console.print(f"[dim]Including 20-minute walking at start and end of journey[/dim]")
@@ -1521,9 +1831,33 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
             if address:
                 title = f"{title} from {address}"
             
-            # Create the interactive map using circle union visualization
+            # Create the interactive map with schedule-based data
+            class MockGraph:
+                def __init__(self, stops_data):
+                    self._nodes = {}
+                    for stop_id, info in stops_data.items():
+                        if info.get('point_type') == 'transit_stop':
+                            # Extract the actual stop_id from the key
+                            actual_stop_id = stop_id.replace('stop_', '')
+                            self._nodes[actual_stop_id] = {
+                                'lat': info.get('lat', 0),
+                                'lon': info.get('lon', 0),
+                                'name': info.get('name', actual_stop_id)
+                            }
+                
+                def has_node(self, node_id):
+                    return node_id in self._nodes
+                
+                @property
+                def nodes(self):
+                    return self._nodes
+            
+            mock_graph = MockGraph(expanded_points)
+            
+            # Use circle union visualization with schedule-based data
             map_path = create_circle_union_map(
-                start_lat, start_lon, union_polygons, reachable_stops, graph, stop_lines_mapping, title, map_output
+                start_lat, start_lon, union_polygons, reachable_stops, mock_graph, stop_lines_mapping, 
+                title, map_output
             )
             
             if map_path:
