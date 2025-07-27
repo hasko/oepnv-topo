@@ -95,7 +95,10 @@ uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 20 --vis
 **Performance Optimizations:**
 - Filters 34k+ stops down to ~2-10k based on reachable distance  
 - Line coverage reduces Dijkstra origins by 10.7x
-- Processes ~200k-1M connections instead of 5.7M total
+- Direction filtering: Prevents U-turns, reduces connections by ~46%
+- Route direction tracking: Only uses one direction per route to avoid inefficient back-and-forth
+- Transfer optimization: Uses GTFS transfer data with 5-minute penalties for route changes
+- Detailed progress reporting: Shows stop filtering, connection processing, and graph statistics
 - Caches geocoding results to avoid repeated API calls
 
 **Next Steps:**

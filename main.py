@@ -472,10 +472,12 @@ def build_transit_graph(conn: sqlite3.Connection,
                       distance_from_start=distance_km)
             reachable_stops.append(stop_id)
     
-    console.print(f"[green]Added {G.number_of_nodes():,} reachable stops (filtered from 34k+)[/green]")
+    total_stops_count = cursor.execute("SELECT COUNT(*) FROM stops").fetchone()[0]
+    console.print(f"[green]Added {G.number_of_nodes():,} reachable stops (filtered from {total_stops_count:,} total)[/green]")
     
     # Add transit connections from stop_times
     console.print("[cyan]Adding transit connections...[/cyan]")
+    console.print(f"[dim]Querying connections between {len(reachable_stops):,} stops...[/dim]")
     
     # Skip if no reachable stops found
     if not reachable_stops:
@@ -486,10 +488,13 @@ def build_transit_graph(conn: sqlite3.Connection,
     reachable_stops_str = "'" + "','".join(reachable_stops) + "'"
     
     # Query to get consecutive stops on each trip with times, filtered by reachable stops
+    # Include route and direction info to prevent U-turns
     query = f"""
     WITH consecutive_stops AS (
         SELECT 
             st1.trip_id,
+            t.route_id,
+            t.direction_id,
             st1.stop_id as from_stop,
             st2.stop_id as to_stop,
             st1.departure_time,
@@ -499,6 +504,7 @@ def build_transit_graph(conn: sqlite3.Connection,
         FROM stop_times st1
         JOIN stop_times st2 ON st1.trip_id = st2.trip_id 
                            AND st2.stop_sequence = st1.stop_sequence + 1
+        JOIN trips t ON st1.trip_id = t.trip_id
         WHERE st1.departure_time IS NOT NULL 
           AND st2.arrival_time IS NOT NULL
           AND st1.departure_time != ''
@@ -508,9 +514,9 @@ def build_transit_graph(conn: sqlite3.Connection,
           AND st1.stop_sequence <= {max_stops_per_trip}
           AND st2.stop_sequence <= {max_stops_per_trip}
     )
-    SELECT from_stop, to_stop, departure_time, arrival_time, COUNT(*) as frequency
+    SELECT from_stop, to_stop, departure_time, arrival_time, route_id, direction_id, COUNT(*) as frequency
     FROM consecutive_stops
-    GROUP BY from_stop, to_stop, departure_time, arrival_time
+    GROUP BY from_stop, to_stop, departure_time, arrival_time, route_id, direction_id
     """
     
     # Process in chunks to handle large dataset
@@ -522,10 +528,16 @@ def build_transit_graph(conn: sqlite3.Connection,
         task = progress.add_task("Processing transit connections...")
         
         cursor.execute(query)
-        connection_count = 0
+        all_rows = cursor.fetchall()
+        total_raw_connections = len(all_rows)
+        console.print(f"[dim]Found {total_raw_connections:,} raw transit connections to process[/dim]")
         
-        for row in cursor.fetchall():
-            from_stop, to_stop, dep_time, arr_time, frequency = row
+        connection_count = 0
+        skipped_opposite_direction = 0
+        route_directions_used = {}  # Track which direction we've used for each route
+        
+        for i, row in enumerate(all_rows):
+            from_stop, to_stop, dep_time, arr_time, route_id, direction_id, frequency = row
             
             try:
                 # Parse times (format: HH:MM:SS)
@@ -543,35 +555,89 @@ def build_transit_graph(conn: sqlite3.Connection,
                 
                 # Only add positive travel times
                 if travel_time > 0:
-                    # Use frequency as a measure of service quality (higher frequency = lower effective wait time)
-                    # Add a base wait time of 5 minutes, reduced by frequency
-                    wait_time = max(300 - frequency * 30, 60)  # Min 1 minute wait
-                    total_time = travel_time + wait_time
+                    # Check if we should use this route direction to prevent U-turns
+                    route_key = route_id
+                    should_add_edge = True
                     
-                    # Add edge if both stops exist in graph
-                    if G.has_node(from_stop) and G.has_node(to_stop):
-                        G.add_edge(from_stop, to_stop, 
-                                 weight=total_time,
-                                 travel_time=travel_time,
-                                 wait_time=wait_time,
-                                 frequency=frequency,
-                                 type='transit')
-                        connection_count += 1
+                    if route_key in route_directions_used:
+                        # If we've already used this route, only allow same direction
+                        if route_directions_used[route_key] != direction_id:
+                            should_add_edge = False
+                            skipped_opposite_direction += 1
+                    else:
+                        # First time seeing this route, record the direction
+                        route_directions_used[route_key] = direction_id
+                    
+                    if should_add_edge:
+                        # BUG FIX: No wait time for consecutive stops on same route
+                        # You're already on the vehicle, so only travel time applies
+                        wait_time = 0
+                        total_time = travel_time  # Only actual travel time
+                        
+                        # Add edge if both stops exist in graph
+                        if G.has_node(from_stop) and G.has_node(to_stop):
+                            G.add_edge(from_stop, to_stop, 
+                                     weight=total_time,
+                                     travel_time=travel_time,
+                                     wait_time=wait_time,
+                                     frequency=frequency,
+                                     route_id=route_id,
+                                     direction_id=direction_id,
+                                     type='transit')
+                            connection_count += 1
                         
             except (ValueError, AttributeError):
                 # Skip malformed time entries
                 continue
                 
-            if connection_count % 10000 == 0:
-                progress.update(task, description=f"Processed {connection_count:,} connections...")
+            if (i + 1) % 10000 == 0:
+                progress.update(task, description=f"Processed {i+1:,}/{total_raw_connections:,} rows, added {connection_count:,} connections...")
     
     console.print(f"[green]Added {connection_count:,} transit connections[/green]")
+    console.print(f"[dim]Skipped {skipped_opposite_direction:,} connections in opposite directions to prevent U-turns[/dim]")
+    console.print(f"[dim]Used {len(route_directions_used):,} unique routes[/dim]")
+    
+    # Add transfer connections from transfers.csv data
+    console.print(f"[cyan]Adding transfer connections from GTFS transfers data...[/cyan]")
+    
+    transfer_query = f"""
+    SELECT from_stop_id, to_stop_id, min_transfer_time
+    FROM transfers
+    WHERE from_stop_id IN ({reachable_stops_str})
+      AND to_stop_id IN ({reachable_stops_str})
+      AND from_stop_id != to_stop_id
+    """
+    
+    cursor.execute(transfer_query)
+    transfer_rows = cursor.fetchall()
+    console.print(f"[dim]Found {len(transfer_rows):,} potential transfer connections to process[/dim]")
+    
+    transfer_count = 0
+    
+    for from_stop, to_stop, min_transfer_time in transfer_rows:
+        if G.has_node(from_stop) and G.has_node(to_stop):
+            # Convert transfer time to int and add 5-minute penalty for route change
+            transfer_penalty = 300  # 5 minutes in seconds
+            min_transfer_seconds = int(min_transfer_time) if min_transfer_time else 0
+            total_transfer_time = min_transfer_seconds + transfer_penalty
+            
+            G.add_edge(from_stop, to_stop,
+                     weight=total_transfer_time,
+                     travel_time=min_transfer_seconds,
+                     wait_time=transfer_penalty,
+                     frequency=1,
+                     type='transfer')
+            transfer_count += 1
+    
+    console.print(f"[green]Added {transfer_count:,} transfer connections[/green]")
     
     # Add walking connections between nearby stops (only among reachable stops)
     console.print(f"[cyan]Adding walking connections (max {max_walking_distance_m}m)...[/cyan]")
     
     walking_connections = 0
     stops_list = list(G.nodes(data=True))
+    total_possible_pairs = len(stops_list) * (len(stops_list) - 1) // 2
+    console.print(f"[dim]Checking {len(stops_list):,} stops for walking connections ({total_possible_pairs:,} possible pairs)[/dim]")
     
     # Only process walking connections if we have a reasonable number of stops
     if len(stops_list) > 2000:

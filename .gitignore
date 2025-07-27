@@ -152,9 +152,16 @@ oepnv.db
 *.sqlite3
 .geocode_cache.json
 transit_graph.gpickle
+output/
 
 # Data directory (contains large GTFS files)
 data/
+
+# Generated visualization files
+*.html
+isochrone_map.html
+*_map.html
+dortmund_test.html
 
 # Temporary files
 *.tmp

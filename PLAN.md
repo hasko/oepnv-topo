@@ -115,11 +115,15 @@ uv run python main.py query --address "Düsseldorf Hbf" --time 20 --visualize
    - CLI integration ✓
    - Color optimization ✓
 
-4. **Phase 4** (Current): Bug fixes and improvements ✓
+4. **Phase 4** (Completed): Bug fixes and graph optimization ✓
    - ✅ Walking time calculation fix
-   - ✅ Debug tools for route investigation
+   - ✅ Debug tools for route investigation  
    - ✅ Improved visualization colors (magenta/purple)
-   - 🔍 Investigating missing bus connections
+   - ✅ Fixed missing bus connections (Route 447, 440, X13)
+   - ✅ Eliminated incorrect wait times for same-route connections
+   - ✅ Added proper transfer penalties using GTFS transfer data
+   - ✅ Implemented direction filtering to prevent U-turns (~46% reduction)
+   - ✅ Enhanced progress reporting with detailed connection statistics
 
 5. **Phase 5**: Advanced features
    - Time-dependent routing

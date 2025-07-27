@@ -121,6 +121,16 @@ The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
 - **Legend and tooltips**: User-friendly interface with clear time zone indicators
 - **Optimized colors**: Magenta/purple color scheme avoids conflicts with green areas on maps
 
+### Recent Improvements (2025-01)
+
+- **✅ Fixed walking time bug**: End walking time no longer incorrectly added to total duration
+- **✅ Enhanced route connectivity**: Route 447 and other bus lines now properly connect destinations
+- **✅ Eliminated wait times for same-route connections**: No artificial delays when staying on same vehicle
+- **✅ Added transfer penalties**: 5-minute penalty only when changing between different routes
+- **✅ Direction filtering**: Prevents inefficient U-turns, reduces graph size by ~46%
+- **✅ Detailed progress reporting**: Shows connection processing, filtering, and graph statistics
+- **✅ Improved visualization colors**: Magenta/purple scheme avoids conflicts with map green areas
+
 ### Current Limitations
 
 - Uses simplified wait times rather than actual schedule-based routing
