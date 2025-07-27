@@ -166,6 +166,261 @@ def find_nearest_stops(conn: sqlite3.Connection, lat: float, lon: float,
     return results[:limit]
 
 
+def find_walkable_stops(conn: sqlite3.Connection, start_lat: float, start_lon: float, 
+                       max_walk_time_minutes: int = 20) -> List[Dict]:
+    """
+    Find all stops within walking distance of starting point
+    Returns list with stop info and walking time to reach each stop
+    """
+    max_walk_distance_km = (max_walk_time_minutes / 60.0) * 5.0  # 5 km/h walking speed
+    
+    cursor = conn.cursor()
+    cursor.execute("SELECT stop_id, stop_name, stop_lat, stop_lon FROM stops")
+    
+    walkable_stops = []
+    for stop_id, stop_name, stop_lat, stop_lon in cursor.fetchall():
+        distance_km = haversine_distance(start_lat, start_lon, stop_lat, stop_lon)
+        
+        if distance_km <= max_walk_distance_km:
+            walk_time_minutes = (distance_km / 5.0) * 60  # Convert back to minutes
+            walkable_stops.append({
+                'stop_id': stop_id,
+                'stop_name': stop_name,
+                'stop_lat': stop_lat,
+                'stop_lon': stop_lon,
+                'distance_km': distance_km,
+                'walk_time_minutes': walk_time_minutes
+            })
+    
+    # Sort by walking time
+    walkable_stops.sort(key=lambda x: x['walk_time_minutes'])
+    return walkable_stops
+
+
+def get_stop_lines_mapping(conn: sqlite3.Connection) -> Dict[str, set]:
+    """
+    Create mapping of stop_id -> set of route_ids that serve this stop
+    This is used for line coverage optimization
+    """
+    cursor = conn.cursor()
+    
+    # Query to find which routes serve each stop
+    query = """
+    SELECT DISTINCT st.stop_id, t.route_id
+    FROM stop_times st
+    JOIN trips t ON st.trip_id = t.trip_id
+    WHERE st.stop_id IS NOT NULL AND t.route_id IS NOT NULL
+    """
+    
+    stop_lines = {}
+    cursor.execute(query)
+    
+    for stop_id, route_id in cursor.fetchall():
+        if stop_id not in stop_lines:
+            stop_lines[stop_id] = set()
+        stop_lines[stop_id].add(route_id)
+    
+    return stop_lines
+
+
+def optimize_walkable_stops_by_line_coverage(walkable_stops: List[Dict], 
+                                           stop_lines_mapping: Dict[str, set]) -> List[Dict]:
+    """
+    Use greedy algorithm to select minimal set of walkable stops that covers all reachable lines
+    
+    Only include a stop if it provides access to lines not available from closer stops
+    """
+    console.print("[cyan]Optimizing walkable stops using line coverage...[/cyan]")
+    
+    covered_lines = set()
+    selected_stops = []
+    
+    # Sort by walking time (closest first)
+    sorted_stops = sorted(walkable_stops, key=lambda x: x['walk_time_minutes'])
+    
+    for stop in sorted_stops:
+        stop_id = stop['stop_id']
+        
+        # Get lines served by this stop
+        stop_lines = stop_lines_mapping.get(stop_id, set())
+        
+        if not stop_lines:
+            # Skip stops with no line information
+            continue
+        
+        # Check if this stop offers any new lines
+        new_lines = stop_lines - covered_lines
+        
+        if new_lines:
+            # This stop provides access to lines we haven't covered yet
+            selected_stops.append(stop)
+            covered_lines.update(new_lines)
+            
+            # Add debug info about what lines this stop provides
+            stop['new_lines'] = new_lines
+            stop['all_lines'] = stop_lines
+    
+    console.print(f"[green]Line coverage optimization: {len(walkable_stops)} → {len(selected_stops)} stops[/green]")
+    console.print(f"[dim]Covers {len(covered_lines)} unique lines/routes[/dim]")
+    
+    # Show first few selected stops with their line contributions
+    console.print("[dim]Selected stops and their unique line contributions:[/dim]")
+    for i, stop in enumerate(selected_stops[:5]):
+        lines_str = ', '.join(sorted(list(stop['new_lines']))[:3])
+        if len(stop['new_lines']) > 3:
+            lines_str += f" (+{len(stop['new_lines'])-3} more)"
+        console.print(f"  {stop['stop_name'][:30]} ({stop['walk_time_minutes']:.1f}min): {lines_str}")
+    
+    if len(selected_stops) > 5:
+        console.print(f"  ... and {len(selected_stops) - 5} more stops")
+    
+    return selected_stops
+
+
+def calculate_multi_origin_isochrone(graph: nx.DiGraph, walkable_stops: List[Dict], 
+                                   max_total_time_minutes: int) -> Dict[str, Dict]:
+    """
+    Calculate isochrone using multiple starting points (all walkable stops)
+    Returns dict mapping stop_id to best travel info (time, route, etc.)
+    """
+    max_total_time_seconds = max_total_time_minutes * 60
+    best_times = {}  # stop_id -> {total_time, walk_time, transit_time, origin_stop}
+    
+    console.print(f"[cyan]Running multi-origin Dijkstra from {len(walkable_stops)} walkable stops...[/cyan]")
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        console=console
+    ) as progress:
+        task = progress.add_task("Processing origins...", total=len(walkable_stops))
+        
+        for walkable_stop in walkable_stops:
+            origin_stop_id = walkable_stop['stop_id']
+            walk_time_seconds = walkable_stop['walk_time_minutes'] * 60
+            available_transit_time = max_total_time_seconds - walk_time_seconds
+            
+            # Skip if walking time alone exceeds total time limit
+            if available_transit_time <= 0:
+                progress.update(task, advance=1)
+                continue
+            
+            # Skip if this stop is not in the graph
+            if not graph.has_node(origin_stop_id):
+                progress.update(task, advance=1)
+                continue
+            
+            # Run Dijkstra from this origin with remaining time budget
+            try:
+                reachable_from_origin = nx.single_source_dijkstra_path_length(
+                    graph, origin_stop_id, cutoff=available_transit_time, weight='weight'
+                )
+                
+                # Update best times for each reachable stop
+                for stop_id, transit_time_seconds in reachable_from_origin.items():
+                    total_time_seconds = walk_time_seconds + transit_time_seconds
+                    
+                    if total_time_seconds <= max_total_time_seconds:
+                        # Keep this result if it's better than previous best
+                        if (stop_id not in best_times or 
+                            total_time_seconds < best_times[stop_id]['total_time_seconds']):
+                            
+                            best_times[stop_id] = {
+                                'total_time_seconds': total_time_seconds,
+                                'walk_time_seconds': walk_time_seconds,
+                                'transit_time_seconds': transit_time_seconds,
+                                'origin_stop': walkable_stop,
+                                'total_time_minutes': total_time_seconds / 60.0,
+                                'walk_time_minutes': walk_time_seconds / 60.0,
+                                'transit_time_minutes': transit_time_seconds / 60.0
+                            }
+            except:
+                # Skip problematic origins
+                pass
+            
+            progress.update(task, advance=1)
+    
+    return best_times
+
+
+def add_end_walking_expansion(reachable_stops: Dict[str, Dict], graph: nx.DiGraph, 
+                            max_walk_time_minutes: int = 20) -> Dict[str, Dict]:
+    """
+    For each transit-reachable stop, add all points within walking distance
+    This represents walking from the final transit stop to the destination
+    
+    Returns expanded reachable points with coordinates
+    """
+    max_walk_distance_km = (max_walk_time_minutes / 60.0) * 5.0  # 5 km/h walking speed
+    expanded_points = {}
+    
+    console.print(f"[cyan]Adding end-of-journey walking expansion (up to {max_walk_time_minutes} min)...[/cyan]")
+    
+    for stop_id, stop_info in reachable_stops.items():
+        # Get stop coordinates from graph
+        if not graph.has_node(stop_id):
+            continue
+            
+        stop_data = graph.nodes[stop_id]
+        stop_lat = stop_data['lat']
+        stop_lon = stop_data['lon']
+        
+        # The reachable point is the stop itself
+        point_key = f"stop_{stop_id}"
+        if point_key not in expanded_points or stop_info['total_time_minutes'] < expanded_points[point_key]['total_time_minutes']:
+            expanded_points[point_key] = {
+                **stop_info,
+                'point_type': 'transit_stop',
+                'lat': stop_lat,
+                'lon': stop_lon,
+                'name': stop_data['name'],
+                'end_walk_time_minutes': 0.0
+            }
+        
+        # Add walking radius around this stop
+        # For visualization, we'll add sample points in a grid pattern
+        walk_radius_deg = max_walk_distance_km / 111.0  # Rough conversion to degrees
+        num_points_per_side = 5  # Create a 5x5 grid of sample points
+        
+        for i in range(num_points_per_side):
+            for j in range(num_points_per_side):
+                # Create grid point within walking radius
+                lat_offset = (i - num_points_per_side//2) * (2 * walk_radius_deg) / num_points_per_side
+                lon_offset = (j - num_points_per_side//2) * (2 * walk_radius_deg) / num_points_per_side
+                
+                point_lat = stop_lat + lat_offset
+                point_lon = stop_lon + lon_offset
+                
+                # Calculate actual walking distance
+                walk_distance_km = haversine_distance(stop_lat, stop_lon, point_lat, point_lon)
+                
+                if walk_distance_km <= max_walk_distance_km:
+                    walk_time_minutes = (walk_distance_km / 5.0) * 60
+                    total_time_minutes = stop_info['total_time_minutes'] + walk_time_minutes
+                    
+                    point_key = f"walk_{point_lat:.4f}_{point_lon:.4f}"
+                    
+                    # Keep this point if it's better than existing or new
+                    if (point_key not in expanded_points or 
+                        total_time_minutes < expanded_points[point_key]['total_time_minutes']):
+                        
+                        expanded_points[point_key] = {
+                            'total_time_minutes': total_time_minutes,
+                            'point_type': 'walking_destination',
+                            'lat': point_lat,
+                            'lon': point_lon,
+                            'name': f"Walking from {stop_data['name'][:20]}",
+                            'transit_stop_info': stop_info,
+                            'end_walk_time_minutes': walk_time_minutes,
+                            'walk_distance_km': walk_distance_km
+                        }
+    
+    console.print(f"[green]Expanded to {len(expanded_points)} reachable points (including walking destinations)[/green]")
+    return expanded_points
+
+
 def build_transit_graph(conn: sqlite3.Connection, 
                        start_lat: float, start_lon: float, 
                        max_time_minutes: int = 30,
@@ -839,13 +1094,31 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
     conn = sqlite3.connect(db_path)
     
     try:
-        # Build optimized graph on-demand
+        # Find all stops within walking distance (20 minutes max)
+        console.print(f"\n[cyan]Finding stops within 20-minute walk of starting point...[/cyan]")
+        walkable_stops = find_walkable_stops(conn, start_lat, start_lon, max_walk_time_minutes=20)
+        
+        if not walkable_stops:
+            console.print("[yellow]No stops found within 20-minute walk of starting location[/yellow]")
+            return
+        
+        console.print(f"[green]Found {len(walkable_stops)} stops within walking distance[/green]")
+        console.print(f"[dim]Closest: {walkable_stops[0]['stop_name']} ({walkable_stops[0]['walk_time_minutes']:.1f}min walk)[/dim]")
+        
+        # Optimize walkable stops using line coverage
+        console.print(f"\n[cyan]Optimizing origins using line coverage analysis...[/cyan]")
+        stop_lines_mapping = get_stop_lines_mapping(conn)
+        optimized_walkable_stops = optimize_walkable_stops_by_line_coverage(walkable_stops, stop_lines_mapping)
+        
+        # Build optimized graph that includes all potentially reachable stops
         console.print(f"\n[cyan]Building transit graph for {max_time}-minute isochrone...[/cyan]")
         
+        # Use the closest optimized stop as the center for graph filtering
+        center_stop = optimized_walkable_stops[0] if optimized_walkable_stops else walkable_stops[0]
         graph = build_transit_graph(
             conn, 
-            start_lat=start_lat, 
-            start_lon=start_lon,
+            start_lat=center_stop['stop_lat'], 
+            start_lon=center_stop['stop_lon'],
             max_time_minutes=max_time,
             max_walking_distance_m=500
         )
@@ -854,69 +1127,72 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
             console.print("[yellow]No reachable stops found for the given parameters[/yellow]")
             return
         
-        # Find the closest stop to starting point as the actual start node
-        nearest_stops = find_nearest_stops(conn, start_lat, start_lon, max_distance_km=2.0, limit=5)
+        # Calculate multi-origin isochrone
+        console.print(f"\n[cyan]Calculating isochrone with enhanced walking model...[/cyan]")
+        console.print(f"[dim]Maximum walking time: 20 minutes at start and end of journey[/dim]")
         
-        if not nearest_stops:
-            console.print("[yellow]No nearby stops found within 2km to start journey[/yellow]")
+        reachable_stops = calculate_multi_origin_isochrone(graph, optimized_walkable_stops, max_time)
+        
+        if not reachable_stops:
+            console.print("[yellow]No stops reachable within time limit[/yellow]")
             return
         
-        start_stop_id = nearest_stops[0]['stop_id']
-        console.print(f"[cyan]Starting from: {nearest_stops[0]['stop_name']} (walk {nearest_stops[0]['distance_km']:.2f}km)[/cyan]")
+        console.print(f"\n[bold green]Found {len(reachable_stops)} reachable stops within {max_time} minutes![/bold green]")
         
-        # Calculate reachable stops using Dijkstra's algorithm
-        console.print(f"[cyan]Calculating reachable stops within {max_time} minutes...[/cyan]")
+        # Add end-of-journey walking expansion
+        expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20)
         
-        # Convert max_time to seconds and add walking time to start
-        max_time_seconds = max_time * 60
-        walk_to_start_seconds = (nearest_stops[0]['distance_km'] * 1000) / 1.4  # 5 km/h walking
-        available_transit_time = max_time_seconds - walk_to_start_seconds
+        console.print(f"[bold green]Total reachable area: {len(expanded_points)} points within {max_time} minutes![/bold green]")
+        console.print(f"[dim]Including 20-minute walking at start and end of journey[/dim]")
         
-        if available_transit_time <= 0:
-            console.print("[yellow]Starting location is too far to walk to nearest stop within time limit[/yellow]")
-            return
+        # Group expanded points by total travel time ranges  
+        time_ranges = [
+            (0, 15, "0-15 min"),
+            (15, 30, "15-30 min"), 
+            (30, 45, "30-45 min"),
+            (45, 60, "45-60 min"),
+            (60, 999, "60+ min")
+        ]
         
-        # Run Dijkstra's algorithm
-        if graph.has_node(start_stop_id):
-            reachable = nx.single_source_dijkstra_path_length(
-                graph, start_stop_id, cutoff=available_transit_time, weight='weight'
-            )
-            
-            console.print(f"\n[bold green]Found {len(reachable)} reachable stops within {max_time} minutes![/bold green]")
-            
-            # Group stops by travel time ranges
-            time_ranges = [
-                (0, 15, "0-15 min"),
-                (15, 30, "15-30 min"), 
-                (30, 45, "30-45 min"),
-                (45, 60, "45-60 min"),
-                (60, 999, "60+ min")
+        for min_time, max_range, label in time_ranges:
+            if max_range > max_time:
+                max_range = max_time
+            if min_time >= max_time:
+                break
+                
+            points_in_range = [
+                (point_id, info) for point_id, info in expanded_points.items()
+                if min_time <= info['total_time_minutes'] <= max_range
             ]
             
-            for min_time, max_range, label in time_ranges:
-                if max_range > max_time:
-                    max_range = max_time
-                if min_time >= max_time:
-                    break
-                    
-                stops_in_range = [
-                    (stop_id, time_sec) for stop_id, time_sec in reachable.items()
-                    if min_time * 60 <= time_sec <= max_range * 60
-                ]
+            if points_in_range:
+                transit_stops = [p for p in points_in_range if p[1]['point_type'] == 'transit_stop']
+                walking_points = [p for p in points_in_range if p[1]['point_type'] == 'walking_destination']
                 
-                if stops_in_range:
-                    console.print(f"\n[bold]{label}: {len(stops_in_range)} stops[/bold]")
+                console.print(f"\n[bold]{label}: {len(points_in_range)} total points[/bold]")
+                console.print(f"[dim]  {len(transit_stops)} transit stops + {len(walking_points)} walking destinations[/dim]")
+                
+                # Show a few examples with breakdown
+                examples = sorted(points_in_range, key=lambda x: x[1]['total_time_minutes'])[:3]
+                for point_id, info in examples:
+                    if info['point_type'] == 'transit_stop':
+                        console.print(f"  🚏 {info['name'][:30]}: {info['total_time_minutes']:.1f}min " +
+                                    f"(walk {info.get('walk_time_minutes', 0):.1f} + transit {info.get('transit_time_minutes', 0):.1f})")
+                    else:
+                        console.print(f"  🚶 {info['name'][:30]}: {info['total_time_minutes']:.1f}min " +
+                                    f"(+{info['end_walk_time_minutes']:.1f}min walk from transit)")
+                
+                if len(points_in_range) > 3:
+                    console.print(f"  ... and {len(points_in_range) - 3} more points")
                     
-                    # Show a few examples
-                    for stop_id, time_sec in sorted(stops_in_range, key=lambda x: x[1])[:5]:
-                        stop_name = graph.nodes[stop_id]['name']
-                        console.print(f"  {stop_name[:40]}: {time_sec/60:.1f} min")
-                    
-                    if len(stops_in_range) > 5:
-                        console.print(f"  ... and {len(stops_in_range) - 5} more")
-            
-        else:
-            console.print(f"[yellow]Starting stop {start_stop_id} not found in graph[/yellow]")
+        # Show summary statistics
+        total_transit_stops = len([p for p in expanded_points.values() if p['point_type'] == 'transit_stop'])
+        total_walking_dest = len([p for p in expanded_points.values() if p['point_type'] == 'walking_destination'])
+        
+        console.print(f"\n[bold]Summary:[/bold]")
+        console.print(f"  Transit stops reachable: {total_transit_stops}")
+        console.print(f"  Additional walking destinations: {total_walking_dest}")
+        console.print(f"  Total reachable area: {len(expanded_points)} points")
         
         console.print(f"\n[dim]Data © OpenStreetMap contributors[/dim]")
         

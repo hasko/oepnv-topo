@@ -23,21 +23,25 @@ uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20  # Coordinate i
 
 ## Next Steps
 
-### 1. Enhanced Walking Model (In Progress)
-**Current Issue**: Walking is limited to 500m transfers between stops
-
-**New Model**: Allow up to 20 minutes of walking time within total journey time
+### 1. Enhanced Walking Model ✅ (Completed)
+**New Model**: 20 minutes of walking time at start and end of journey
 
 #### Walking Components:
-1. **Start walking**: Walk up to 20min to reach any transit stop
-2. **End walking**: Walk up to 20min from final transit stop
-3. **Transfer walking**: Keep current 500m limit between stops
+1. ✅ **Start walking**: Walk up to 20min to reach any transit stop
+2. ✅ **End walking**: Walk up to 20min from final transit stop  
+3. ✅ **Transfer walking**: 500m limit between stops (realistic transfers)
+4. ✅ **Line coverage optimization**: Smart origin selection to avoid redundancy
 
-#### Implementation Plan:
-- **Multi-origin Dijkstra**: Use ALL stops within 20min walk as starting points
-- **Time budgeting**: For each origin stop, remaining_time = total_time - walk_time_to_stop  
-- **End expansion**: Add 20min walking radius to all transit-reachable stops
-- **Result display**: Show walking vs transit time breakdown
+#### Implemented Features:
+- ✅ **Multi-origin Dijkstra**: From optimized subset of walkable stops
+- ✅ **Time budgeting**: remaining_time = total_time - walk_time_to_stop
+- ✅ **End expansion**: 20min walking radius from all transit destinations
+- ✅ **Line coverage**: 320 → 30 origins (10x speedup) while covering all 80 lines
+- ✅ **Rich output**: Walking vs transit time breakdown with emoji indicators
+
+#### Results:
+- **Before**: ~5 reachable stops in 20 minutes
+- **After**: 3,173 reachable points (125 transit + 3,048 walking destinations)
 
 ### 2. Spatial Optimization for Walking Connections
 **Current Issue**: O(n²) walking connection calculation causes 2000-stop limit

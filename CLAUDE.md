@@ -49,26 +49,36 @@ uv run python main.py build-graph --lat 51.2197 --lon 6.7943 --time 30
 
 - `geocode_address()` - OpenStreetMap geocoding with caching
 - `build_transit_graph()` - Optimized graph building with distance/time filtering  
+- `find_walkable_stops()` - Find all stops within 20-minute walk
+- `optimize_walkable_stops_by_line_coverage()` - Line coverage optimization
+- `calculate_multi_origin_isochrone()` - Multi-origin Dijkstra algorithm
+- `add_end_walking_expansion()` - 20-minute walking from transit destinations
 - `haversine_distance()` - Calculate distance between coordinates in km
-- `find_nearest_stops()` - Spatial query to find stops near a location
-- NetworkX Dijkstra's algorithm for isochrone calculation
 
 ## Implementation Status
 
 ✅ **Completed Core Features:**
 1. ✅ Geocode German addresses using OpenStreetMap/Nominatim
 2. ✅ Build optimized transit graphs from GTFS data
-3. ✅ Calculate isochrones (reachable areas) within time limits
-4. ✅ Smart filtering: distance-based (50km/h max) and journey length (1 stop/min)
-5. ✅ On-demand graph building for efficient queries
+3. ✅ Enhanced walking model: 20 minutes at start and end of journey
+4. ✅ Line coverage optimization: Smart origin selection (10x speedup)
+5. ✅ Multi-origin isochrone calculation with time budgeting
+6. ✅ End-of-journey walking expansion to destinations
+
+**Enhanced Walking Model:**
+- Multi-origin Dijkstra from all stops within 20-minute walk
+- Line coverage optimization: 320 → 30 origins while covering all 80 lines
+- End walking expansion: 20-minute radius from transit destinations
+- Results: 3,173 reachable points vs ~5 with basic model
 
 **Performance Optimizations:**
-- Filters 34k+ stops down to ~2-10k based on reachable distance
+- Filters 34k+ stops down to ~2-10k based on reachable distance  
+- Line coverage reduces Dijkstra origins by 10.7x
 - Processes ~200k-1M connections instead of 5.7M total
-- Uses Dijkstra's algorithm for accurate travel time calculations
 - Caches geocoding results to avoid repeated API calls
 
 **Next Steps:**
 - Visualization: Generate isochrone maps using folium or matplotlib
 - Export: Save results as GeoJSON or other map formats
+- Spatial indexing: R-tree optimization for walking connections
 - Time-dependent routing: Use actual departure times from schedules

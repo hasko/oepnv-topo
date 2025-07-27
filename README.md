@@ -17,10 +17,11 @@ This tool calculates how far you can travel using public transport (buses, train
 
 ## Example Results
 
-From Düsseldorf Hauptbahnhof in 30 minutes:
-- 41 reachable stops total
-- 11 stops within 15 minutes (local S-Bahn network)
-- 30 stops within 15-30 minutes (regional connections to Neuss, Airport, etc.)
+From Düsseldorf Hauptbahnhof in 20 minutes with enhanced walking model:
+- **3,173 total reachable points** (vs ~5 with basic model)
+- **125 transit stops** reachable by public transport + walking
+- **3,048 additional walking destinations** within 20min of transit stops
+- **10.7x performance optimization** using line coverage (320 → 30 origins)
 
 ## Installation
 
@@ -86,15 +87,22 @@ The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
 4. Run Dijkstra's algorithm to find shortest paths within time limit
 5. Group and display results by travel time ranges
 
+### Enhanced Walking Model
+
+- **Start walking**: Up to 20 minutes to reach any transit stop (finds optimal origins)
+- **End walking**: 20-minute radius from each transit-reachable stop
+- **Line coverage optimization**: Smart selection of origins to avoid redundancy
+- **Transfer walking**: 500m limit between stops (realistic transfer distance)
+
 ### Current Limitations
 
-- Walking is currently limited to 500m transfers between stops
 - Uses simplified wait times rather than actual schedule-based routing
 - No real-time data integration
+- Walking connections between stops limited by 2000-stop performance threshold
 
 ## Next Steps
 
-- **Enhanced walking model**: 20-minute walking at start/end of journey
 - **Visualization**: Generate interactive maps showing isochrone areas
 - **Export options**: GeoJSON, KML for use in mapping applications
 - **Time-dependent routing**: Use actual departure times from schedules
+- **Spatial indexing**: R-tree optimization for walking connections
