@@ -150,6 +150,8 @@ oepnv.db
 *.db
 *.sqlite
 *.sqlite3
+.geocode_cache.json
+transit_graph.gpickle
 
 # Data directory (contains large GTFS files)
 data/
