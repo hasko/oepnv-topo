@@ -125,10 +125,20 @@ uv run python main.py query --address "Düsseldorf Hbf" --time 20 --visualize
    - ✅ Implemented direction filtering to prevent U-turns (~46% reduction)
    - ✅ Enhanced progress reporting with detailed connection statistics
 
-5. **Phase 5**: Advanced features
-   - Time-dependent routing
-   - Multi-modal integration
-   - Real-time data
+5. **Phase 5** (Completed): Circle Union Visualization ✓
+   - ✅ Replaced alpha shapes with precise circle union boundaries
+   - ✅ Dynamic circle sizing based on remaining time budget per transit stop
+   - ✅ Union polygon computation with hole preservation and complex geometry handling
+   - ✅ Human-readable line names in hover tooltips (447, U43, S1 instead of technical IDs)
+   - ✅ Enhanced transit stop markers with interactive travel time and line information
+   - ✅ GitHub Pages compatible static HTML output for web deployment
+
+6. **Phase 6**: Advanced features (Future)
+   - Time-dependent routing using actual GTFS schedules
+   - Multi-modal integration (bike sharing, Park+Ride)
+   - Real-time data integration for delays and disruptions
+   - Batch processing for multiple cities
+   - API endpoint for web application integration
 
 ## Technical Decisions
 

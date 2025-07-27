@@ -44,6 +44,9 @@ uv run python main.py init
 # Find stops reachable within 30 minutes from an address
 uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30
 
+# Generate interactive map with precise circle union boundaries
+uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30 --visualize
+
 # Using coordinates instead of address
 uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20
 
@@ -73,8 +76,11 @@ uv run python main.py visualize --lat 51.2197 --lon 6.7943 --time 20 --simple
 # Combine query calculation with automatic map generation
 uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 20 --visualize
 
-# Custom output filename
+# Custom output filename  
 uv run python main.py visualize --address "Essen Hauptbahnhof" --time 30 --output essen_map.html
+
+# Simple boundary map (faster generation)
+uv run python main.py visualize --address "Köln Hauptbahnhof" --time 25 --simple
 ```
 
 ## Data
@@ -113,23 +119,27 @@ The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
 
 ### Interactive Visualization Features
 
-- **Time-layered polygons**: Different colored zones for 0-10min, 10-20min, 20-30min travel times
-- **Alpha shapes**: Realistic concave boundaries that handle gaps in coverage
-- **OpenStreetMap integration**: Free base tiles with professional cartographic styling
-- **Interactive HTML output**: Zoomable, pannable maps that work in any browser
-- **Transit stop markers**: Individual stops with travel time popups
-- **Legend and tooltips**: User-friendly interface with clear time zone indicators
-- **Optimized colors**: Magenta/purple color scheme avoids conflicts with green areas on maps
+- **Circle Union Boundaries**: Precise walking areas computed as unions of circles around transit stops
+- **Time-Based Layering**: Color-coded zones showing 0-10min, 10-20min, 20-30min travel times
+- **Accurate Geometry**: Preserves holes, disconnected areas, and complex shapes that alpha shapes would approximate
+- **Interactive Transit Markers**: Click/hover stops to see travel times and serving lines (447, U43, S1, etc.)
+- **OpenStreetMap Integration**: Professional cartographic styling with free base tiles
+- **Static HTML Output**: Self-contained files ready for GitHub Pages or web deployment
+- **Responsive Design**: Works seamlessly on desktop and mobile browsers
+- **Human-Readable Information**: Passenger-friendly line names and clear time indicators
 
 ### Recent Improvements (2025-01)
 
+- **✅ Circle Union Visualization**: Replaced alpha shapes with precise circular walking areas based on remaining time budget
+- **✅ Human-Readable Line Names**: Hover tooltips show passenger-friendly names (447, U43, S1) instead of technical IDs
+- **✅ Enhanced Transit Stop Markers**: Interactive markers with travel times and serving line information
 - **✅ Fixed walking time bug**: End walking time no longer incorrectly added to total duration
 - **✅ Enhanced route connectivity**: Route 447 and other bus lines now properly connect destinations
 - **✅ Eliminated wait times for same-route connections**: No artificial delays when staying on same vehicle
 - **✅ Added transfer penalties**: 5-minute penalty only when changing between different routes
 - **✅ Direction filtering**: Prevents inefficient U-turns, reduces graph size by ~46%
 - **✅ Detailed progress reporting**: Shows connection processing, filtering, and graph statistics
-- **✅ Improved visualization colors**: Magenta/purple scheme avoids conflicts with map green areas
+- **✅ GitHub Pages Compatible**: Generated maps are static HTML files ready for web deployment
 
 ### Current Limitations
 

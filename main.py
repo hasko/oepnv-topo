@@ -12,14 +12,18 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRe
 from rich.table import Table
 import pandas as pd
 from math import radians, cos, sin, acos, sqrt, atan2
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Union
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 import time
 import json
 from datetime import datetime
 import networkx as nx
-from visualization import create_isochrone_map, create_simple_boundary_map
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union, transform
+import pyproj
+from functools import partial
+from visualization import create_isochrone_map, create_simple_boundary_map, create_circle_union_map
 
 
 console = Console()
@@ -200,26 +204,30 @@ def find_walkable_stops(conn: sqlite3.Connection, start_lat: float, start_lon: f
 
 def get_stop_lines_mapping(conn: sqlite3.Connection) -> Dict[str, set]:
     """
-    Create mapping of stop_id -> set of route_ids that serve this stop
-    This is used for line coverage optimization
+    Create mapping of stop_id -> set of human-readable route short names (like "447", "U43", "X13")
+    This is used for line coverage optimization and display
     """
     cursor = conn.cursor()
     
-    # Query to find which routes serve each stop
+    # Query to find which routes serve each stop, getting human-readable route short names
     query = """
-    SELECT DISTINCT st.stop_id, t.route_id
+    SELECT DISTINCT st.stop_id, COALESCE(r.route_short_name, t.route_id) as line_name
     FROM stop_times st
     JOIN trips t ON st.trip_id = t.trip_id
-    WHERE st.stop_id IS NOT NULL AND t.route_id IS NOT NULL
+    JOIN routes r ON t.route_id = r.route_id
+    WHERE st.stop_id IS NOT NULL 
+      AND t.route_id IS NOT NULL
+      AND COALESCE(r.route_short_name, t.route_id) IS NOT NULL
+      AND COALESCE(r.route_short_name, t.route_id) != ''
     """
     
     stop_lines = {}
     cursor.execute(query)
     
-    for stop_id, route_id in cursor.fetchall():
+    for stop_id, line_name in cursor.fetchall():
         if stop_id not in stop_lines:
             stop_lines[stop_id] = set()
-        stop_lines[stop_id].add(route_id)
+        stop_lines[stop_id].add(line_name)
     
     return stop_lines
 
@@ -346,18 +354,221 @@ def calculate_multi_origin_isochrone(graph: nx.DiGraph, walkable_stops: List[Dic
     return best_times
 
 
+def create_walking_circles_union(reachable_stops: Dict[str, Dict], graph: nx.DiGraph,
+                                max_walk_time_minutes: int = 20, max_total_time_minutes: int = 60) -> Tuple[Dict[str, Polygon], Dict[str, List[Polygon]]]:
+    """
+    Create walking circles around each reachable transit stop based on remaining time budget,
+    then compute the union of all circles to create accurate isochrone boundaries.
+    
+    Args:
+        reachable_stops: Dictionary of reachable stops with timing data
+        graph: Transit network graph with stop coordinates
+        max_walk_time_minutes: Maximum walking time from transit stops
+        max_total_time_minutes: Maximum total travel time budget
+    
+    Returns:
+        Dictionary mapping time ranges to Polygon geometries representing unioned walking areas
+    """
+    console.print(f"[cyan]Creating walking circles with remaining time budget...[/cyan]")
+    
+    # Set up coordinate transformation for accurate buffering
+    # Use a central point to determine appropriate UTM zone
+    central_lat = sum(graph.nodes[stop_id]['lat'] for stop_id in reachable_stops if graph.has_node(stop_id)) / len(reachable_stops)
+    central_lon = sum(graph.nodes[stop_id]['lon'] for stop_id in reachable_stops if graph.has_node(stop_id)) / len(reachable_stops)
+    
+    # Determine UTM zone for accurate meter-based calculations
+    utm_zone = int((central_lon + 180) / 6) + 1
+    utm_crs = f"EPSG:{32600 + utm_zone}"  # UTM North zones
+    
+    # Create coordinate transformers
+    wgs84_to_utm = pyproj.Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+    utm_to_wgs84 = pyproj.Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
+    
+    # Group circles by time ranges for layered visualization
+    time_ranges = [
+        (0, 10, 'very_close'),
+        (10, 20, 'close'), 
+        (20, 30, 'medium'),
+        (30, 45, 'far'),
+        (45, 60, 'very_far')
+    ]
+    
+    circles_by_range = {name: [] for _, _, name in time_ranges}
+    
+    max_walk_distance_km = (max_walk_time_minutes / 60.0) * 5.0  # 5 km/h walking speed
+    
+    for stop_id, stop_info in reachable_stops.items():
+        if not graph.has_node(stop_id):
+            continue
+            
+        stop_data = graph.nodes[stop_id]
+        stop_lat = stop_data['lat']
+        stop_lon = stop_data['lon']
+        
+        # Calculate remaining time budget for walking
+        transit_time = stop_info['total_time_minutes']
+        remaining_time = max_total_time_minutes - transit_time
+        
+        # Only create circles if we have remaining time for walking
+        if remaining_time > 0:
+            # Calculate walking radius based on remaining time (capped at max_walk_time)
+            available_walk_time = min(remaining_time, max_walk_time_minutes)
+            walk_radius_km = (available_walk_time / 60.0) * 5.0  # 5 km/h walking speed
+            walk_radius_meters = walk_radius_km * 1000
+            
+            # Transform stop coordinates to UTM for accurate buffering
+            utm_x, utm_y = wgs84_to_utm.transform(stop_lon, stop_lat)
+            
+            # Create circle in UTM coordinates (meters)
+            stop_point_utm = Point(utm_x, utm_y)
+            circle_utm = stop_point_utm.buffer(walk_radius_meters)
+            
+            # Transform circle back to WGS84
+            circle_wgs84 = transform(utm_to_wgs84.transform, circle_utm)
+            
+            # Determine which time range this stop belongs to
+            for min_time, max_time, range_name in time_ranges:
+                if min_time <= transit_time < max_time:
+                    circles_by_range[range_name].append(circle_wgs84)
+                    break
+    
+    # Compute union for each time range
+    union_polygons = {}
+    total_circles = sum(len(circles) for circles in circles_by_range.values())
+    console.print(f"[dim]Computing unions for {total_circles} walking circles across {len(time_ranges)} time ranges[/dim]")
+    
+    for range_name, circles in circles_by_range.items():
+        if circles:
+            console.print(f"[dim]Computing union for {len(circles)} circles in {range_name} range[/dim]")
+            union_poly = unary_union(circles)
+            union_polygons[range_name] = union_poly
+            
+            # Calculate area for reporting
+            if hasattr(union_poly, 'area'):
+                area_approx = union_poly.area * 111.0 * 111.0  # Rough conversion to km²
+                console.print(f"[green]✓ {range_name}: {len(circles)} circles → {area_approx:.1f} km² union[/green]")
+    
+    console.print(f"[green]Created {len(union_polygons)} time-based walking area unions[/green]")
+    return union_polygons
+
+
+def union_polygons_to_points(union_polygons: Dict[str, Polygon], reachable_stops: Dict[str, Dict], 
+                           graph: nx.DiGraph, sample_density: float = 0.002) -> Dict[str, Dict]:
+    """
+    Convert union polygons back to point format for compatibility with existing visualization.
+    Sample points from polygon boundaries and interiors to represent the reachable areas.
+    
+    Args:
+        union_polygons: Dictionary of time range -> union polygon
+        reachable_stops: Original reachable stops data
+        graph: Transit network graph
+        sample_density: Density of sampling (degrees between sample points)
+    
+    Returns:
+        Dictionary of points compatible with existing visualization format
+    """
+    console.print(f"[cyan]Converting {len(union_polygons)} union polygons to sample points...[/cyan]")
+    
+    expanded_points = {}
+    
+    # First, add all the original transit stops
+    for stop_id, stop_info in reachable_stops.items():
+        if not graph.has_node(stop_id):
+            continue
+            
+        stop_data = graph.nodes[stop_id]
+        point_key = f"stop_{stop_id}"
+        expanded_points[point_key] = {
+            **stop_info,
+            'point_type': 'transit_stop',
+            'lat': stop_data['lat'],
+            'lon': stop_data['lon'],
+            'name': stop_data['name'],
+            'end_walk_time_minutes': 0.0
+        }
+    
+    # Time range mapping to minutes for point classification
+    range_to_minutes = {
+        'very_close': 5,   # 0-10min range → use 5min as representative
+        'close': 15,       # 10-20min range → use 15min as representative  
+        'medium': 25,      # 20-30min range → use 25min as representative
+        'far': 37,         # 30-45min range → use 37min as representative
+        'very_far': 52     # 45-60min range → use 52min as representative
+    }
+    
+    # Sample points from each union polygon
+    for range_name, polygon in union_polygons.items():
+        if not polygon or polygon.is_empty:
+            continue
+            
+        representative_time = range_to_minutes.get(range_name, 30)
+        console.print(f"[dim]Sampling points from {range_name} polygon (representative time: {representative_time}min)[/dim]")
+        
+        # Get polygon bounds for sampling grid
+        bounds = polygon.bounds
+        min_lon, min_lat, max_lon, max_lat = bounds
+        
+        # Create sampling grid
+        sample_points = []
+        current_lat = min_lat
+        while current_lat <= max_lat:
+            current_lon = min_lon
+            while current_lon <= max_lon:
+                point = Point(current_lon, current_lat)
+                if polygon.contains(point):
+                    sample_points.append((current_lat, current_lon))
+                current_lon += sample_density
+            current_lat += sample_density
+        
+        # Add sampled points to results
+        for i, (point_lat, point_lon) in enumerate(sample_points):
+            point_key = f"union_{range_name}_{i}"
+            expanded_points[point_key] = {
+                'total_time_minutes': representative_time,
+                'point_type': 'walking_destination',
+                'lat': point_lat,
+                'lon': point_lon,
+                'name': f"Walking area ({range_name})",
+                'end_walk_time_minutes': 5.0,  # Estimated walking time
+                'walk_distance_km': 0.4,  # Estimated walk distance
+                'transit_time_to_stop': representative_time - 5.0
+            }
+        
+        console.print(f"[green]✓ Sampled {len(sample_points)} points from {range_name} polygon[/green]")
+    
+    console.print(f"[green]Converted union polygons to {len(expanded_points)} sample points[/green]")
+    return expanded_points
+
+
 def add_end_walking_expansion(reachable_stops: Dict[str, Dict], graph: nx.DiGraph, 
-                            max_walk_time_minutes: int = 20, max_total_time_minutes: int = 60) -> Dict[str, Dict]:
+                            max_walk_time_minutes: int = 20, max_total_time_minutes: int = 60, 
+                            use_circle_unions: bool = False, return_polygons: bool = False) -> Union[Dict[str, Dict], Tuple[Dict[str, Dict], Dict[str, Polygon]]]:
     """
     For each transit-reachable stop, add all points within walking distance
     This represents walking from the final transit stop to the destination
     
+    Args:
+        use_circle_unions: If True, use accurate circle union approach instead of grid sampling
+    
     Returns expanded reachable points with coordinates
     """
+    # Use new circle union approach if requested
+    if use_circle_unions:
+        console.print(f"[cyan]Using circle union approach for walking expansion...[/cyan]")
+        union_polygons = create_walking_circles_union(reachable_stops, graph, max_walk_time_minutes, max_total_time_minutes)
+        expanded_points = union_polygons_to_points(union_polygons, reachable_stops, graph)
+        
+        if return_polygons:
+            return expanded_points, union_polygons
+        else:
+            return expanded_points
+    
+    # Fall back to original grid-based approach
     max_walk_distance_km = (max_walk_time_minutes / 60.0) * 5.0  # 5 km/h walking speed
     expanded_points = {}
     
     console.print(f"[cyan]Adding end-of-journey walking expansion (up to {max_walk_time_minutes} min)...[/cyan]")
+    console.print(f"[dim]Using grid-based sampling approach[/dim]")
     
     for stop_id, stop_info in reachable_stops.items():
         # Get stop coordinates from graph
@@ -1218,8 +1429,13 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
         
         console.print(f"\n[bold green]Found {len(reachable_stops)} reachable stops within {max_time} minutes![/bold green]")
         
-        # Add end-of-journey walking expansion
-        expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time)
+        # Add end-of-journey walking expansion using circle union approach
+        if visualize:
+            # Get both points and polygons for circle union visualization
+            expanded_points, union_polygons = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time, use_circle_unions=True, return_polygons=True)
+        else:
+            # Get just points for regular processing
+            expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time, use_circle_unions=True)
         
         console.print(f"[bold green]Total reachable area: {len(expanded_points)} points within {max_time} minutes![/bold green]")
         console.print(f"[dim]Including 20-minute walking at start and end of journey[/dim]")
@@ -1305,9 +1521,9 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dep
             if address:
                 title = f"{title} from {address}"
             
-            # Create the interactive map
-            map_path = create_isochrone_map(
-                start_lat, start_lon, visualization_data, title, map_output
+            # Create the interactive map using circle union visualization
+            map_path = create_circle_union_map(
+                start_lat, start_lon, union_polygons, reachable_stops, graph, stop_lines_mapping, title, map_output
             )
             
             if map_path:
@@ -1511,8 +1727,13 @@ def visualize(db_path: str, address: str, lat: float, lon: float, max_time: int,
             console.print("[yellow]No stops reachable within time limit[/yellow]")
             return
         
-        # Add end-of-journey walking expansion
-        expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time)
+        # Add end-of-journey walking expansion using circle union approach
+        if simple:
+            # For simple boundary maps, just get points  
+            expanded_points = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time, use_circle_unions=True)
+        else:
+            # Get both points and polygons for circle union visualization
+            expanded_points, union_polygons = add_end_walking_expansion(reachable_stops, graph, max_walk_time_minutes=20, max_total_time_minutes=max_time, use_circle_unions=True, return_polygons=True)
         
         # Convert to format expected by visualization functions
         visualization_data = {}
@@ -1547,8 +1768,8 @@ def visualize(db_path: str, address: str, lat: float, lon: float, max_time: int,
                 start_lat, start_lon, visualization_data, max_time, title, output
             )
         else:
-            map_path = create_isochrone_map(
-                start_lat, start_lon, visualization_data, title, output
+            map_path = create_circle_union_map(
+                start_lat, start_lon, union_polygons, reachable_stops, graph, stop_lines_mapping, title, output
             )
         
         if map_path:

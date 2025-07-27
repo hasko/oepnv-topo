@@ -61,9 +61,9 @@ uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 20 --vis
 - `calculate_multi_origin_isochrone()` - Multi-origin Dijkstra algorithm
 - `add_end_walking_expansion()` - 20-minute walking from transit destinations
 - `haversine_distance()` - Calculate distance between coordinates in km
-- `create_isochrone_map()` - Generate time-layered interactive maps with Folium
-- `create_simple_boundary_map()` - Generate single polygon boundary maps
-- `points_to_polygon()` - Convert coordinate points to alpha shape polygons
+- `create_walking_circles_union()` - Generate union polygons from walking circles with remaining time budget
+- `create_circle_union_map()` - Generate interactive maps with precise circular boundaries and line information
+- `get_stop_lines_mapping()` - Extract human-readable line names (447, U43, S1) from GTFS data
 
 ## Implementation Status
 
@@ -84,13 +84,13 @@ uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 20 --vis
 - Results: 3,173 reachable points vs ~5 with basic model
 
 **Interactive Visualization Features:**
-- Folium-based interactive maps with OpenStreetMap base tiles
-- Alpha shape polygons: Realistic concave boundaries handling coverage gaps
-- Time-layered overlays: Color-coded zones (0-10min, 10-20min, 20-30min, etc.)
-- Transit stop markers: Individual stops with travel time popups
-- Professional styling: Legend, tooltips, zoom/pan functionality
+- Circle union boundaries: Precise walking areas computed as unions of circles around transit stops
+- Time-layered overlays: Color-coded zones (0-10min, 10-20min, 20-30min, etc.) based on remaining time budget
+- Interactive transit markers: Click/hover stops to see travel times and human-readable line names (447, U43, S1)
+- Accurate geometry: Preserves holes, disconnected areas, and complex shapes
+- Static HTML output: Self-contained files ready for GitHub Pages deployment
+- Professional styling: Legend, tooltips, zoom/pan functionality with responsive design
 - CLI integration: Standalone and integrated with query command
-- Optimized colors: Magenta/purple scheme avoids conflicts with map green areas
 
 **Performance Optimizations:**
 - Filters 34k+ stops down to ~2-10k based on reachable distance  

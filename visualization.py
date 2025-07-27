@@ -8,7 +8,7 @@ import alphashape
 from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.ops import transform
 import pandas as pd
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 from rich.console import Console
 import os
 
@@ -204,6 +204,160 @@ def create_isochrone_map(
     return absolute_path
 
 
+def create_circle_union_map(
+    center_lat: float,
+    center_lon: float,
+    union_polygons: Dict[str, 'Polygon'],
+    walking_circles: Dict[str, List['Polygon']] = None,
+    title: str = "Walking Circle Unions",
+    output_file: str = "circle_union_map.html",
+    show_individual_circles: bool = False
+) -> str:
+    """
+    Create map showing accurate union polygons directly without point sampling.
+    Optionally overlay individual walking circles to show the true boundaries.
+    
+    Args:
+        center_lat: Center latitude (starting point)
+        center_lon: Center longitude (starting point) 
+        union_polygons: Dictionary of time range -> union polygon geometries
+        walking_circles: Optional dict of time range -> list of individual circles
+        title: Map title
+        output_file: Output HTML filename
+        show_individual_circles: Whether to overlay individual walking circles
+    
+    Returns:
+        Path to generated HTML file
+    """
+    console.print(f"[cyan]Creating circle union map: {title}[/cyan]")
+    
+    # Initialize map centered on starting location
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=12,
+        tiles='OpenStreetMap'
+    )
+    
+    # Add title
+    title_html = f'''
+                 <h3 align="center" style="font-size:16px; margin-top:10px;"><b>{title}</b></h3>
+                 '''
+    m.get_root().html.add_child(folium.Element(title_html))
+    
+    # Add center marker
+    folium.Marker(
+        [center_lat, center_lon],
+        popup="Starting Point",
+        tooltip="Starting Point",
+        icon=folium.Icon(color='red', icon='play')
+    ).add_to(m)
+    
+    # Color scheme for time ranges
+    time_range_colors = {
+        'very_close': '#ff00ff',   # bright magenta
+        'close': '#dd44dd',        # medium orchid
+        'medium': '#bb88bb',       # plum  
+        'far': '#cc99cc',          # thistle
+        'very_far': '#e6d6e6'      # light lavender
+    }
+    
+    time_range_labels = {
+        'very_close': '0-10 minutes',
+        'close': '10-20 minutes', 
+        'medium': '20-30 minutes',
+        'far': '30-45 minutes',
+        'very_far': '45-60 minutes'
+    }
+    
+    # Add union polygons as primary visualization
+    console.print(f"[cyan]Adding {len(union_polygons)} union polygons...[/cyan]")
+    for range_name, polygon in union_polygons.items():
+        if not polygon or polygon.is_empty:
+            continue
+            
+        color = time_range_colors.get(range_name, '#888888')
+        label = time_range_labels.get(range_name, range_name)
+        
+        # Convert to GeoDataFrame for Folium
+        gdf = gpd.GeoDataFrame([1], geometry=[polygon], crs="EPSG:4326")
+        
+        # Add union polygon to map
+        folium.GeoJson(
+            gdf.geometry.iloc[0],
+            style_function=lambda feature, color=color: {
+                'fillColor': color,
+                'color': color,
+                'weight': 3,
+                'fillOpacity': 0.4,
+                'opacity': 0.8
+            },
+            popup=f"Union area: {label}",
+            tooltip=f"Reachable in {label}"
+        ).add_to(m)
+        
+        console.print(f"[green]Added union polygon for {label}[/green]")
+    
+    # Optionally overlay individual walking circles
+    if show_individual_circles and walking_circles:
+        console.print(f"[cyan]Adding individual walking circles...[/cyan]")
+        circle_count = 0
+        
+        for range_name, circles in walking_circles.items():
+            if not circles:
+                continue
+                
+            color = time_range_colors.get(range_name, '#888888')
+            
+            for circle in circles:
+                if not circle or circle.is_empty:
+                    continue
+                    
+                # Create lighter, semi-transparent circles for individual boundaries
+                folium.GeoJson(
+                    circle,
+                    style_function=lambda feature, color=color: {
+                        'fillColor': 'none',
+                        'color': color,
+                        'weight': 1,
+                        'fillOpacity': 0.0,
+                        'opacity': 0.3,
+                        'dashArray': '5, 5'  # dashed outline
+                    },
+                    popup="Individual walking circle",
+                    tooltip="20-min walking radius"
+                ).add_to(m)
+                circle_count += 1
+        
+        console.print(f"[green]Added {circle_count} individual walking circles[/green]")
+    
+    # Add legend
+    legend_html = f'''
+    <div style="position: fixed; 
+                bottom: 50px; left: 50px; width: 220px; height: 140px; 
+                background-color: white; border:2px solid grey; z-index:9999; 
+                font-size:14px; padding: 10px
+                ">
+    <p><b>Walking Area Unions</b></p>
+    <p><i class="fa fa-circle" style="color:#ff00ff"></i> 0-10 minutes</p>
+    <p><i class="fa fa-circle" style="color:#dd44dd"></i> 10-20 minutes</p>
+    <p><i class="fa fa-circle" style="color:#bb88bb"></i> 20-30 minutes</p>
+    <p><i class="fa fa-circle" style="color:#cc99cc"></i> 30-45 minutes</p>
+    <p><i class="fa fa-circle" style="color:#e6d6e6"></i> 45-60 minutes</p>
+    {"<p><i>Dashed lines: Individual circles</i></p>" if show_individual_circles else ""}
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+    
+    # Save map
+    m.save(output_file)
+    absolute_path = os.path.abspath(output_file)
+    
+    console.print(f"[green]✓ Circle union map saved to: {absolute_path}[/green]")
+    console.print(f"[dim]Open in browser: file://{absolute_path}[/dim]")
+    
+    return absolute_path
+
+
 def create_simple_boundary_map(
     center_lat: float,
     center_lon: float,
@@ -290,6 +444,179 @@ def create_simple_boundary_map(
     
     console.print(f"[green]✓ Boundary map saved to: {absolute_path}[/green]")
     console.print(f"[green]✓ Polygon covers {len(points)} reachable points[/green]")
+    console.print(f"[dim]Open in browser: file://{absolute_path}[/dim]")
+    
+    return absolute_path
+
+
+def create_circle_union_map(
+    center_lat: float,
+    center_lon: float,
+    union_polygons: Dict[str, Polygon],
+    reachable_stops: Dict[str, Dict],
+    graph,
+    stop_lines_mapping: Dict[str, set] = None,
+    title: str = "Circle Union Isochrone",
+    output_file: str = "circle_union_map.html"
+) -> str:
+    """
+    Create an interactive map showing union polygons directly instead of alpha shapes.
+    This preserves the accurate circular boundaries from the union calculation.
+    
+    Args:
+        center_lat: Center latitude (starting point)
+        center_lon: Center longitude (starting point)
+        union_polygons: Dictionary mapping time ranges to union polygon geometries
+        reachable_stops: Dictionary of reachable transit stops for markers
+        graph: NetworkX graph with stop coordinates
+        stop_lines_mapping: Dictionary mapping stop_id to set of route_ids (optional)
+        title: Map title
+        output_file: Output HTML filename
+    
+    Returns:
+        Path to generated HTML file
+    """
+    console.print(f"[cyan]Creating circle union map: {title}[/cyan]")
+    
+    # Initialize map centered on starting location
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=12,
+        tiles='OpenStreetMap'
+    )
+    
+    # Add title
+    title_html = f'''
+                 <h3 align="center" style="font-size:16px; margin-top:10px;"><b>{title}</b></h3>
+                 '''
+    m.get_root().html.add_child(folium.Element(title_html))
+    
+    # Add center marker
+    folium.Marker(
+        [center_lat, center_lon],
+        popup="Starting Point",
+        tooltip="Starting Point",
+        icon=folium.Icon(color='red', icon='play')
+    ).add_to(m)
+    
+    # Color mapping for time ranges
+    range_colors = {
+        'very_close': ('#ff00ff', 'bright magenta', '0-10 minutes'),      
+        'close': ('#dd44dd', 'medium orchid', '10-20 minutes'),           
+        'medium': ('#bb88bb', 'plum', '20-30 minutes'),                   
+        'far': ('#cc99cc', 'thistle', '30-45 minutes'),                   
+        'very_far': ('#e6d6e6', 'light lavender', '45-60 minutes')        
+    }
+    
+    # Add union polygons directly to the map
+    legend_items = []
+    for range_name, polygon in union_polygons.items():
+        if not polygon or polygon.is_empty:
+            continue
+            
+        color, color_name, time_desc = range_colors.get(range_name, ('#888888', 'gray', 'unknown'))
+        
+        # Handle MultiPolygon by processing each polygon separately
+        polygons_to_add = []
+        if isinstance(polygon, MultiPolygon):
+            polygons_to_add = list(polygon.geoms)
+        else:
+            polygons_to_add = [polygon]
+        
+        for poly in polygons_to_add:
+            if poly.is_valid and not poly.is_empty:
+                # Convert to GeoDataFrame for Folium
+                gdf = gpd.GeoDataFrame([1], geometry=[poly], crs="EPSG:4326")
+                
+                # Add polygon to map with preserved circular boundaries
+                folium.GeoJson(
+                    gdf.geometry.iloc[0],
+                    style_function=lambda feature, color=color: {
+                        'fillColor': color,
+                        'color': color,
+                        'weight': 2,
+                        'fillOpacity': 0.3,
+                        'opacity': 0.6
+                    },
+                    popup=f"Walking area reachable in {time_desc}",
+                    tooltip=f"{time_desc} (circle union)"
+                ).add_to(m)
+        
+        # Calculate area for reporting
+        area_approx = polygon.area * 111.0 * 111.0  # Rough conversion to km²
+        console.print(f"[magenta]Added {color_name} union: {area_approx:.1f} km² ({time_desc})[/magenta]")
+        legend_items.append((color, time_desc))
+    
+    # Add individual transit stops as markers
+    transit_stops = 0
+    for stop_id, stop_info in reachable_stops.items():
+        # Get coordinates from graph and travel time from stop info
+        if graph.has_node(stop_id):
+            stop_data = graph.nodes[stop_id]
+            lat = stop_data.get('lat')
+            lon = stop_data.get('lon')
+            stop_name = stop_data.get('name', f'Stop {stop_id}')
+            travel_time = stop_info.get('total_time_minutes', 0)
+            
+            # Get line information if available
+            lines_info = ""
+            if stop_lines_mapping and stop_id in stop_lines_mapping:
+                lines = sorted(list(stop_lines_mapping[stop_id]))
+                if lines:
+                    # Show first 4 lines, then indicate if there are more
+                    if len(lines) <= 4:
+                        lines_info = f"<br>Lines: {', '.join(lines)}"
+                    else:
+                        lines_info = f"<br>Lines: {', '.join(lines[:4])} (+{len(lines)-4} more)"
+            
+            if lat is not None and lon is not None:
+                # Create tooltip text with line information
+                tooltip_text = f"{stop_name} ({travel_time:.1f}min)"
+                if lines_info:
+                    # Extract just the line names for tooltip (no HTML)
+                    lines_for_tooltip = sorted(list(stop_lines_mapping[stop_id])) if stop_lines_mapping and stop_id in stop_lines_mapping else []
+                    if lines_for_tooltip:
+                        if len(lines_for_tooltip) <= 3:
+                            tooltip_text += f" • {', '.join(lines_for_tooltip)}"
+                        else:
+                            tooltip_text += f" • {', '.join(lines_for_tooltip[:3])}..."
+                
+                folium.CircleMarker(
+                    [lat, lon],
+                    radius=4,
+                    popup=f"{stop_name}<br>Travel time: {travel_time:.1f} min{lines_info}",
+                    tooltip=tooltip_text,
+                    color='darkblue',
+                    fillColor='lightblue',
+                    fillOpacity=0.8,
+                    weight=2
+                ).add_to(m)
+                transit_stops += 1
+    
+    console.print(f"[blue]Added {transit_stops} transit stop markers[/blue]")
+    
+    # Add dynamic legend based on what's actually shown
+    if legend_items:
+        legend_html = '''
+        <div style="position: fixed; 
+                    bottom: 50px; left: 50px; width: 220px; height: auto; 
+                    background-color: white; border:2px solid grey; z-index:9999; 
+                    font-size:14px; padding: 10px
+                    ">
+        <p><b>Walking Areas (Circle Unions)</b></p>
+        '''
+        for color, time_desc in legend_items:
+            legend_html += f'<p><i class="fa fa-circle" style="color:{color}"></i> {time_desc}</p>'
+        legend_html += '</div>'
+        
+        m.get_root().html.add_child(folium.Element(legend_html))
+    
+    # Save map
+    m.save(output_file)
+    absolute_path = os.path.abspath(output_file)
+    
+    console.print(f"[green]✓ Circle union map saved to: {absolute_path}[/green]")
+    console.print(f"[green]✓ Shows {len(union_polygons)} union polygons with preserved boundaries[/green]")
     console.print(f"[dim]Open in browser: file://{absolute_path}[/dim]")
     
     return absolute_path
