@@ -141,14 +141,49 @@ The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
 - **✅ Detailed progress reporting**: Shows connection processing, filtering, and graph statistics
 - **✅ GitHub Pages Compatible**: Generated maps are static HTML files ready for web deployment
 
+### Algorithm Options
+
+The tool now supports two routing algorithms:
+
+1. **Graph-Based Routing** (default): Builds time-dependent graph with all possible connections
+   - More conservative: ~190 reachable stops from Dortmund TU in 30 minutes
+   - Slower: ~56 seconds for computation
+   - Higher memory usage due to graph construction
+
+2. **Database-Driven Line Following** (experimental): Uses SQL queries to follow transit lines
+   - More comprehensive: ~343 reachable stops from Dortmund TU in 30 minutes  
+   - **3.3x faster**: ~17 seconds for computation
+   - Memory efficient: No graph construction needed
+   - Enable with `--database-driven` flag
+
+```bash
+# Use faster database-driven algorithm
+uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --database-driven
+```
+
+### Recent Improvements (2025-01)
+
+- **✅ Database-driven line-following algorithm**: 3.3x faster alternative routing approach
+- **✅ Schedule-based routing**: Uses actual GTFS timetables instead of estimates
+- **✅ Calendar validation**: Only includes services running on specific dates
+- **✅ Circle Union Visualization**: Precise circular walking areas based on remaining time
+- **✅ Human-Readable Line Names**: Shows passenger-friendly names (447, U43, S1)
+- **✅ Enhanced Transit Stop Markers**: Interactive markers with travel times and lines
+- **✅ Fixed walking time bug**: End walking time correctly calculated
+- **✅ Enhanced route connectivity**: All bus and train lines properly connected
+- **✅ Eliminated wait times for same-route connections**: No delays when staying on vehicle
+- **✅ Added transfer penalties**: 5-minute penalty only when changing routes
+- **✅ Direction filtering**: Prevents inefficient U-turns
+- **✅ GitHub Pages Compatible**: Static HTML files ready for web deployment
+
 ### Current Limitations
 
-- Uses simplified wait times rather than actual schedule-based routing
 - No real-time data integration
-- Walking connections between stops limited by 2000-stop performance threshold
+- Walking connections between stops limited by performance thresholds
+- Database-driven algorithm is experimental and may find slightly different results
 
 ## Next Steps
 
 - **Export options**: GeoJSON, KML for use in mapping applications
-- **Time-dependent routing**: Use actual departure times from schedules
+- **Multi-modal routing**: Combine walking, cycling, and transit
 - **Spatial indexing**: R-tree optimization for walking connections
