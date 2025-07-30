@@ -254,20 +254,11 @@ def find_walkable_stops(conn: sqlite3.Connection, start_lat: float, start_lon: f
     """
     max_walk_distance_km = (max_walk_time_minutes / 60.0) * 5.0  # 5 km/h walking speed
     
-    # Add geographic bounds to avoid issues with distant coordinates in international datasets
-    # Use a reasonable bounding box around the start point (±2 degrees ≈ ±200km)
-    lat_min = start_lat - 2.0
-    lat_max = start_lat + 2.0  
-    lon_min = start_lon - 2.0
-    lon_max = start_lon + 2.0
-    
     cursor = conn.cursor()
     cursor.execute("""
         SELECT stop_id, stop_name, stop_lat, stop_lon 
-        FROM stops 
-        WHERE stop_lat BETWEEN ? AND ? 
-        AND stop_lon BETWEEN ? AND ?
-    """, (lat_min, lat_max, lon_min, lon_max))
+        FROM stops
+    """)
     
     walkable_stops = []
     for stop_id, stop_name, stop_lat, stop_lon in cursor.fetchall():
@@ -298,14 +289,14 @@ def get_stop_lines_mapping(conn: sqlite3.Connection) -> Dict[str, set]:
     
     # Query to find which routes serve each stop, getting human-readable route short names
     query = """
-    SELECT DISTINCT st.stop_id, COALESCE(r.route_short_name, t.route_id) as line_name
+    SELECT DISTINCT st.stop_id, r.route_short_name as line_name
     FROM stop_times st
     JOIN trips t ON st.trip_id = t.trip_id
     JOIN routes r ON t.route_id = r.route_id
     WHERE st.stop_id IS NOT NULL 
       AND t.route_id IS NOT NULL
-      AND COALESCE(r.route_short_name, t.route_id) IS NOT NULL
-      AND COALESCE(r.route_short_name, t.route_id) != ''
+      AND r.route_short_name IS NOT NULL
+      AND r.route_short_name != ''
     """
     
     stop_lines = {}
@@ -548,13 +539,13 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
                                 
                                 # Get routes/lines available at this transfer stop
                                 cursor.execute("""
-                                    SELECT DISTINCT 
-                                        COALESCE(r.route_short_name, r.route_long_name, r.route_id) as route_name
+                                    SELECT DISTINCT r.route_short_name as route_name
                                     FROM routes r
                                     JOIN trips t ON r.route_id = t.route_id
                                     JOIN stop_times st ON t.trip_id = st.trip_id
                                     WHERE st.stop_id = ?
-                                    AND COALESCE(r.route_short_name, r.route_long_name, r.route_id) IS NOT NULL
+                                    AND r.route_short_name IS NOT NULL
+                                    AND r.route_short_name != ''
                                     ORDER BY route_name
                                     LIMIT 10
                                 """, (to_stop_id,))
@@ -1294,7 +1285,7 @@ def import_gtfs_data(conn: sqlite3.Connection, data_dir: str) -> Dict[str, int]:
 
 def import_csv_file(conn: sqlite3.Connection, file_path: Path, table_name: str, 
                    delimiter: str, encoding: str) -> int:
-    """Import a single CSV file into the database"""
+    """Import a single CSV file into the database with data quality fixes"""
     cursor = conn.cursor()
     
     # Get file size for progress bar
@@ -1310,6 +1301,39 @@ def import_csv_file(conn: sqlite3.Connection, file_path: Path, table_name: str,
         column_names = ','.join(columns)
         
         insert_sql = f"INSERT OR REPLACE INTO {table_name} ({column_names}) VALUES ({placeholders})"
+        
+        # Apply data quality fixes based on table type
+        def apply_data_quality_fixes(row_dict: Dict) -> Optional[Dict]:
+            """Apply data quality fixes to a row, return None to skip row"""
+            
+            # Geographic bounds filtering for stops table
+            if table_name == 'stops':
+                try:
+                    lat = float(row_dict.get('stop_lat', 0))
+                    lon = float(row_dict.get('stop_lon', 0))
+                    
+                    # Filter out stops outside reasonable German bounds
+                    # Germany roughly: lat 47-55, lon 5-15
+                    if not (45 <= lat <= 57 and 3 <= lon <= 17):
+                        return None  # Skip this stop
+                except (ValueError, TypeError):
+                    return None  # Skip malformed coordinates
+            
+            # Route name normalization for routes table
+            elif table_name == 'routes':
+                # Ensure we have at least one name field
+                short_name = row_dict.get('route_short_name', '').strip()
+                long_name = row_dict.get('route_long_name', '').strip()
+                route_id = row_dict.get('route_id', '').strip()
+                
+                # If both names are empty, use route_id as short_name
+                if not short_name and not long_name:
+                    row_dict['route_short_name'] = route_id
+                elif not short_name and long_name:
+                    # If only long_name exists, copy it to short_name for consistency
+                    row_dict['route_short_name'] = long_name[:20]  # Truncate if too long
+            
+            return row_dict
         
         # Count total rows for large files
         if table_name == 'stop_times':
@@ -1332,25 +1356,43 @@ def import_csv_file(conn: sqlite3.Connection, file_path: Path, table_name: str,
                 
                 for chunk in pd.read_csv(file_path, delimiter=delimiter, encoding=encoding, 
                                         chunksize=chunk_size):
-                    # Convert DataFrame to list of tuples for bulk insert
-                    records = chunk.to_records(index=False).tolist()
-                    cursor.executemany(insert_sql, records)
-                    total_rows += len(records)
+                    # Apply data quality fixes to each row in chunk
+                    cleaned_records = []
+                    for _, row in chunk.iterrows():
+                        row_dict = row.to_dict()
+                        cleaned_row = apply_data_quality_fixes(row_dict)
+                        if cleaned_row is not None:  # Keep row if not filtered out
+                            cleaned_records.append([cleaned_row.get(col, None) for col in columns])
+                    
+                    if cleaned_records:
+                        cursor.executemany(insert_sql, cleaned_records)
+                        total_rows += len(cleaned_records)
                     
                     # Update progress based on file position
                     progress.update(task, advance=chunk_size * len(chunk.columns) * 50)
                     
             return total_rows
         else:
-            # For smaller files, use regular csv reader
+            # For smaller files, use regular csv reader with data quality fixes
             records = []
+            skipped_count = 0
             with open(file_path, 'r', encoding=encoding) as f:
                 reader = csv.DictReader(f, delimiter=delimiter)
                 for row in reader:
-                    values = [row.get(col, None) for col in columns]
-                    records.append(values)
+                    cleaned_row = apply_data_quality_fixes(row)
+                    if cleaned_row is not None:  # Keep row if not filtered out
+                        values = [cleaned_row.get(col, None) for col in columns]
+                        records.append(values)
+                    else:
+                        skipped_count += 1
             
-            cursor.executemany(insert_sql, records)
+            if records:
+                cursor.executemany(insert_sql, records)
+            
+            # Report data quality filtering
+            if skipped_count > 0:
+                console.print(f"[yellow]Data quality: Filtered out {skipped_count:,} records from {table_name}[/yellow]")
+            
             return len(records)
 
 
@@ -1657,6 +1699,8 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
             return
         
         # Handle date auto-selection and validation
+        # Track if we auto-selected the date for better user feedback
+        auto_selected_date = False
         if not date:
             # Auto-select a good Tuesday
             console.print("[cyan]No date specified, auto-selecting optimal date...[/cyan]")
@@ -1664,7 +1708,7 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
             if not date:
                 console.print("[red]Could not find a suitable date in the database[/red]")
                 return
-            console.print(f"[green]Auto-selected date: {date}[/green]")
+            auto_selected_date = True
         
         # Parse and validate date
         try:
@@ -1689,8 +1733,13 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
                     console.print(f"[green]Suggestion: Use --date {good_date} ({good_obj.strftime('%A, %B %d, %Y')})[/green]")
             return
         
-        console.print(f"[dim]Date: {date_obj.strftime('%A, %B %d, %Y')}[/dim]")
-        console.print(f"[dim]Departure: {departure} ({start_time_seconds} seconds since midnight)[/dim]")
+        # Display reference date and time prominently
+        if auto_selected_date:
+            console.print(f"\n[bold green]🗓️  Using auto-selected: {date_obj.strftime('%A, %B %d, %Y')} at {departure}[/bold green]")
+            console.print(f"[dim]Auto-selected optimal Tuesday with active transit services[/dim]")
+        else:
+            console.print(f"\n[bold]🗓️  Reference: {date_obj.strftime('%A, %B %d, %Y')} at {departure}[/bold]")
+            console.print(f"[dim]User-specified date and departure time[/dim]")
         
         # Use database-driven line-following algorithm
         console.print(f"\n[bold cyan]Using database-driven line-following algorithm for {date}[/bold cyan]")
@@ -1768,7 +1817,7 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
             # Use circle union visualization with schedule-based data
             map_path = create_circle_union_map(
                 start_lat, start_lon, union_polygons, reachable_stops, conn, stop_lines_mapping, 
-                title, map_output
+                title, map_output, date, departure
             )
             
             if map_path:

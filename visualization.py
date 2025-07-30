@@ -457,7 +457,9 @@ def create_circle_union_map(
     conn,
     stop_lines_mapping: Dict[str, set] = None,
     title: str = "Circle Union Isochrone",
-    output_file: str = "circle_union_map.html"
+    output_file: str = "circle_union_map.html",
+    reference_date: str = None,
+    departure_time: str = None
 ) -> str:
     """
     Create an interactive map showing union polygons directly instead of alpha shapes.
@@ -472,6 +474,8 @@ def create_circle_union_map(
         stop_lines_mapping: Dictionary mapping stop_id to set of route_ids (optional)
         title: Map title
         output_file: Output HTML filename
+        reference_date: Reference date in YYYYMMDD format
+        departure_time: Departure time in HH:MM format
     
     Returns:
         Path to generated HTML file
@@ -485,10 +489,31 @@ def create_circle_union_map(
         tiles='OpenStreetMap'
     )
     
-    # Add title
+    # Add title with optional date/time information
     title_html = f'''
                  <h3 align="center" style="font-size:16px; margin-top:10px;"><b>{title}</b></h3>
                  '''
+    
+    # Add reference date and time if provided
+    if reference_date and departure_time:
+        from datetime import datetime
+        try:
+            date_obj = datetime.strptime(reference_date, '%Y%m%d')
+            subtitle_html = f'''
+                         <p align="center" style="font-size:12px; margin-top:-5px; color:#666;">
+                         Reference: {date_obj.strftime('%A, %B %d, %Y')} at {departure_time}
+                         </p>
+                         '''
+            title_html += subtitle_html
+        except:
+            # If date parsing fails, just show the raw date
+            subtitle_html = f'''
+                         <p align="center" style="font-size:12px; margin-top:-5px; color:#666;">
+                         Reference: {reference_date} at {departure_time}
+                         </p>
+                         '''
+            title_html += subtitle_html
+    
     m.get_root().html.add_child(folium.Element(title_html))
     
     # Add center marker
