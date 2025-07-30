@@ -533,7 +533,24 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
                                 result = cursor.fetchone()
                                 transfer_name = result[0] if result else to_stop_id
                                 transfer_minutes = (transfer_time_seconds or 300) / 60.0
-                                console.print(f"    🔄 Transfer to {transfer_name} ({transfer_minutes:.1f}min transfer)")
+                                
+                                # Get routes/lines available at this transfer stop
+                                cursor.execute("""
+                                    SELECT DISTINCT r.route_short_name
+                                    FROM routes r
+                                    JOIN trips t ON r.route_id = t.route_id
+                                    JOIN stop_times st ON t.trip_id = st.trip_id
+                                    WHERE st.stop_id = ?
+                                    AND r.route_short_name IS NOT NULL
+                                    ORDER BY r.route_short_name
+                                    LIMIT 10
+                                """, (to_stop_id,))
+                                routes = [row[0] for row in cursor.fetchall()]
+                                routes_str = ", ".join(routes) if routes else "no routes"
+                                if len(routes) > 10:
+                                    routes_str += " ..."
+                                
+                                console.print(f"    🔄 Transfer to {transfer_name} ({transfer_minutes:.1f}min transfer) - lines: {routes_str}")
                         elif verbose:
                             cursor = conn.cursor()
                             cursor.execute("SELECT stop_name FROM stops WHERE stop_id = ?", (to_stop_id,))
