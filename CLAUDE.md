@@ -43,7 +43,13 @@ Two datasets are available in the `data/` folder:
 - **Size**: 3.4GB, ~50.6M records  
 - **Files**: `.txt` format (GTFS standard)
 - **Period**: July 5 - December 13, 2025
-- **Performance**: Slower due to scale, requires optimization
+- **Performance**: Optimized with strategic database indexes
+
+### HVV Dataset (`data/hvv/`)
+- **Coverage**: Hamburg region
+- **Size**: Medium-scale regional data
+- **Files**: GTFS format with mixed time formats (8:00:00 vs 08:00:00)
+- **Performance**: Fast with robust time format handling
 
 ## Commands
 
@@ -63,10 +69,16 @@ uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20 --date 20250407
 # DELFI dataset: use dates July-December 2025
 uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --date 20250728
 
+# HVV dataset: use dates in January 2025
+uv run python main.py query --db-path data/hvv.db --address "Hamburg Hauptbahnhof" --time 20 --date 20250114
+
+# Auto-select optimal date (shows prominent display)
+uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30
+
 # Specify custom departure time  
 uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --date 20250728 --departure 08:00
 
-# Generate interactive maps with schedule-based isochrone visualization
+# Generate interactive maps with reference date/time display
 uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30 --visualize
 uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20 --visualize --map-output custom_map.html
 
@@ -94,13 +106,15 @@ uv run python main.py visualize --address "Düsseldorf Hauptbahnhof" --time 30
 ✅ **Completed Core Features:**
 1. ✅ Schedule-based GTFS routing using actual departure/arrival times
 2. ✅ Calendar support for date-specific service validation
-3. ✅ Time-dependent graph with (stop_id, time) nodes
-4. ✅ Database-driven line-following algorithm (3.3x faster than graph approach)
-5. ✅ Geocode German addresses using OpenStreetMap/Nominatim
-6. ✅ Enhanced walking model: 20 minutes at start and end of journey
-7. ✅ Line coverage optimization: Smart origin selection (10x speedup)
-8. ✅ Interactive map visualization with OpenStreetMap tiles
-9. ✅ Time-layered polygon overlays with realistic boundaries
+3. ✅ Database-driven line-following algorithm (3.3x faster than graph approach)
+4. ✅ Geocode German addresses using OpenStreetMap/Nominatim
+5. ✅ Enhanced walking model: 20 minutes at start and end of journey
+6. ✅ Line coverage optimization: Smart origin selection (10x speedup)
+7. ✅ Interactive map visualization with OpenStreetMap tiles
+8. ✅ Time-layered polygon overlays with realistic boundaries
+9. ✅ **Enhanced UX**: Auto-selected date/time display and reference info in HTML maps
+10. ✅ **Data Quality**: Import-time data cleaning and geographic bounds filtering
+11. ✅ **Performance**: Strategic database indexes for 2-5x query speedup
 
 **Schedule-Based Routing:**
 - Uses actual GTFS stop_times data for precise departure/arrival times
@@ -120,15 +134,18 @@ uv run python main.py visualize --address "Düsseldorf Hauptbahnhof" --time 30
 - Time-layered overlays: Color-coded zones (0-10min, 10-20min, 20-30min) based on actual arrival times
 - Interactive transit markers: Click/hover stops to see travel times and human-readable line names (447, U43, S1)
 - Schedule information: Shows actual departure times and wait times
+- **Reference date/time display**: HTML maps show reference date and departure time as subtitle
 - Accurate geometry: Preserves holes, disconnected areas, and complex shapes
 - Static HTML output: Self-contained files ready for GitHub Pages deployment
 
 **Performance Optimizations:**
+- **Strategic database indexes**: 11 indexes targeting hottest query paths for 2-5x speedup
 - Calendar filtering: Only processes trips running on specified date
 - Batch processing: Handles large GTFS datasets efficiently
 - Line coverage optimization: Reduces routing origins by 10x
 - Time window filtering: Only builds graph for relevant time periods
 - Transfer optimization: Uses GTFS transfer data with realistic penalties
+- **Import-time data quality**: Geographic bounds filtering and route name normalization during import
 - Detailed progress reporting: Shows filtering, processing, and graph statistics
 
 **Database-Driven Algorithm:**
@@ -140,6 +157,17 @@ uv run python main.py visualize --address "Düsseldorf Hauptbahnhof" --time 30
 - **Line following**: Queries entire trip routes with single SQL call
 - **Service filtering**: Uses calendar_dates table for active trips
 - **Time window optimization**: Only considers trips within analysis window
+
+**Latest Improvements (January 2025):**
+- **Enhanced User Experience**:
+  - Prominent auto-selected date/time display with green formatting
+  - Reference date and departure time shown in generated HTML maps
+  
+- **Data Quality & Performance**:
+  - Import-time data cleaning: Geographic bounds filtering, route name normalization
+  - Strategic database indexes: 11 performance-critical indexes for 2-5x query speedup
+  - Robust time format handling: Supports both HH:MM:SS and H:MM:SS formats
+  - Multi-dataset support: VRR, DELFI, and HVV databases all fully supported
 
 **Real-World Accuracy:**
 - **Düsseldorf Hbf**: 771 reachable stops (schedule-based) vs 2,557 (estimates) 

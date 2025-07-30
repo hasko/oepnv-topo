@@ -1221,13 +1221,38 @@ def create_schema(cursor: sqlite3.Cursor):
     """)
     
     # Create indexes for better query performance
+    # Existing indexes
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stops_lat_lon ON stops(stop_lat, stop_lon)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times(stop_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trips_route_id ON trips(route_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_calendar_dates_date ON calendar_dates(date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trips_service_id ON trips(service_id)")
     
-    console.print("[green]Schema created successfully[/green]")
+    # Performance-critical indexes for database-driven routing algorithm
+    console.print("[cyan]Creating performance indexes for routing queries...[/cyan]")
+    
+    # Critical: Speed up trip departures lookup (most frequent query)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stop_times_stop_trip ON stop_times(stop_id, trip_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stop_times_trip_sequence ON stop_times(trip_id, stop_sequence)")
+    
+    # Critical: Speed up service filtering for active trips on date
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_calendar_dates_service_date ON calendar_dates(service_id, date)")
+    
+    # Important: Speed up route information lookups
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trips_service_route ON trips(service_id, route_id)")
+    
+    # Important: Speed up transfer lookups
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_from_stop ON transfers(from_stop_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_to_stop ON transfers(to_stop_id)")
+    
+    # Useful: Speed up line coverage optimization queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stop_times_stop_trip_route ON stop_times(stop_id, trip_id)")
+    
+    # Useful: Speed up geographic queries for finding walkable stops
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stops_lat ON stops(stop_lat)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stops_lon ON stops(stop_lon)")
+    
+    console.print("[green]Schema and performance indexes created successfully[/green]")
 
 
 def import_gtfs_data(conn: sqlite3.Connection, data_dir: str) -> Dict[str, int]:
