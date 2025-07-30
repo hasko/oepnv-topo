@@ -11,13 +11,14 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
 from rich.table import Table
 import pandas as pd
+import math
 from math import radians, cos, sin, acos, sqrt, atan2
 from typing import Dict, Tuple, List, Optional, Union
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 # networkx removed - using database-driven approach
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union, transform
@@ -385,7 +386,8 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
                                     walkable_stops: List[Dict],
                                     start_time_seconds: int,
                                     max_total_time_minutes: int,
-                                    date_str: str) -> Dict[str, Dict]:
+                                    date_str: str,
+                                    verbose: bool = False) -> Dict[str, Dict]:
     """
     Database-driven line-following algorithm that explores transit lines and transfers
     without building a graph in memory. Uses targeted SQL queries to follow lines.
@@ -446,10 +448,21 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
             
             # Skip if we've already visited this stop with a better time
             if current_stop in visited and visited[current_stop] <= arrival_time:
+                if verbose:
+                    console.print(f"[dim]~~{current_stop}~~ (visited earlier at {seconds_to_time_str(visited[current_stop])})[/dim]")
                 continue
             
             # Mark as visited with this arrival time
             visited[current_stop] = arrival_time
+            
+            if verbose:
+                # Get human-readable stop name
+                cursor = conn.cursor()
+                cursor.execute("SELECT stop_name FROM stops WHERE stop_id = ?", (current_stop,))
+                result = cursor.fetchone()
+                stop_name = result[0] if result else current_stop
+                remaining_time = max_total_time_minutes - total_time_minutes
+                console.print(f"[cyan]🚏 {stop_name} (arrive {seconds_to_time_str(arrival_time)}, {remaining_time:.1f}min budget)[/cyan]")
             
             # Add to results
             reachable_stops[current_stop] = {
@@ -462,11 +475,21 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
                 conn, current_stop, arrival_time, end_time_seconds, date_str
             )
             
+            if verbose and departing_trips:
+                console.print(f"  Found {len(departing_trips)} departing trips:")
+            
             for trip_id, departure_time, boarding_sequence, route_name in departing_trips:
+                if verbose:
+                    wait_time = (departure_time - arrival_time) / 60.0
+                    console.print(f"    📍 {route_name} departs {seconds_to_time_str(departure_time)} (wait {wait_time:.1f}min)")
+                
                 # Get ALL downstream stops on this trip in one query
                 downstream_stops = query_all_stops_on_trip(
                     conn, trip_id, boarding_sequence, end_time_seconds
                 )
+                
+                if verbose:
+                    console.print(f"      → {len(downstream_stops)} stops on this trip")
                 
                 # Add each reachable stop to exploration queue
                 for stop_id, stop_arrival_time in downstream_stops:
@@ -476,10 +499,25 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
                     # Only explore if we haven't seen it with better time
                     if stop_id not in visited or stop_arrival_time < visited[stop_id]:
                         to_explore.append((stop_id, stop_arrival_time, total_time_to_stop))
+                        if verbose:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT stop_name FROM stops WHERE stop_id = ?", (stop_id,))
+                            result = cursor.fetchone()
+                            dest_name = result[0] if result else stop_id
+                            console.print(f"        ✓ {dest_name} at {seconds_to_time_str(stop_arrival_time)} ({total_time_to_stop:.1f}min total)")
+                    elif verbose:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT stop_name FROM stops WHERE stop_id = ?", (stop_id,))
+                        result = cursor.fetchone()
+                        dest_name = result[0] if result else stop_id
+                        console.print(f"        ~~{dest_name}~~ (already visited faster)")
             
             # Also check transfers from this stop
             if total_time_minutes < max_total_time_minutes - 5:  # At least 5 min for transfers
                 transfers = query_direct_transfers(conn, current_stop)
+                
+                if verbose and transfers:
+                    console.print(f"  Found {len(transfers)} transfer options:")
                 
                 for to_stop_id, transfer_time_seconds in transfers:
                     transfer_arrival = arrival_time + (transfer_time_seconds or 300)  # Default 5 min
@@ -489,6 +527,19 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
                         
                         if to_stop_id not in visited or transfer_arrival < visited[to_stop_id]:
                             to_explore.append((to_stop_id, transfer_arrival, total_time_to_transfer))
+                            if verbose:
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT stop_name FROM stops WHERE stop_id = ?", (to_stop_id,))
+                                result = cursor.fetchone()
+                                transfer_name = result[0] if result else to_stop_id
+                                transfer_minutes = (transfer_time_seconds or 300) / 60.0
+                                console.print(f"    🔄 Transfer to {transfer_name} ({transfer_minutes:.1f}min transfer)")
+                        elif verbose:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT stop_name FROM stops WHERE stop_id = ?", (to_stop_id,))
+                            result = cursor.fetchone()
+                            transfer_name = result[0] if result else to_stop_id
+                            console.print(f"    ~~Transfer to {transfer_name}~~ (already visited faster)")
     
     console.print(f"[green]Explored {iterations} iterations, found {len(reachable_stops)} reachable stops[/green]")
     return reachable_stops
@@ -856,6 +907,67 @@ def seconds_to_time_str(seconds: int) -> str:
     mins = (seconds % 3600) // 60
     secs = seconds % 60
     return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+
+def get_database_date_range(conn: sqlite3.Connection) -> Tuple[Optional[str], Optional[str]]:
+    """Get the date range covered by the database"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute('SELECT MIN(date), MAX(date) FROM calendar_dates WHERE exception_type = 1')
+        result = cursor.fetchone()
+        return result if result and result[0] and result[1] else (None, None)
+    except:
+        return (None, None)
+
+
+def find_good_tuesday(conn: sqlite3.Connection) -> Optional[str]:
+    """Find a Tuesday that has active services and isn't a holiday"""
+    min_date, max_date = get_database_date_range(conn)
+    if not min_date or not max_date:
+        return None
+    
+    # Start from min_date and find the first Tuesday
+    start_date = datetime.strptime(min_date, '%Y%m%d')
+    
+    # Find first Tuesday at or after start_date
+    days_until_tuesday = (1 - start_date.weekday()) % 7  # Tuesday is weekday 1
+    current_date = start_date + timedelta(days=days_until_tuesday)
+    
+    cursor = conn.cursor()
+    end_date = datetime.strptime(max_date, '%Y%m%d')
+    
+    # Look for a Tuesday with active services (try up to 10 Tuesdays)
+    for week in range(10):
+        if current_date > end_date:
+            break
+            
+        date_str = current_date.strftime('%Y%m%d')
+        
+        # Check if this date has active services
+        cursor.execute('''
+            SELECT COUNT(*) FROM calendar_dates 
+            WHERE date = ? AND exception_type = 1
+        ''', (date_str,))
+        
+        count = cursor.fetchone()[0]
+        if count > 0:
+            return date_str
+            
+        current_date += timedelta(days=7)  # Next Tuesday
+    
+    return None
+
+
+def validate_date_coverage(conn: sqlite3.Connection, date_str: str) -> bool:
+    """Check if the given date has active services in the database"""
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT COUNT(*) FROM calendar_dates 
+        WHERE date = ? AND exception_type = 1
+    ''', (date_str,))
+    
+    count = cursor.fetchone()[0]
+    return count > 0
 
 
 @click.group()
@@ -1437,11 +1549,12 @@ def debug(db_path: str, route: str, stop: str, address1: str, address2: str):
 @click.option('--lat', type=float, help='Starting latitude (alternative to address)')
 @click.option('--lon', type=float, help='Starting longitude (alternative to address)')
 @click.option('--time', 'max_time', default=30, help='Maximum travel time in minutes')
-@click.option('--date', default='20250407', help='Travel date (YYYYMMDD format, default: April 7, 2025 - Monday)')
+@click.option('--date', help='Travel date (YYYYMMDD format, auto-selects good Tuesday if not specified)')
 @click.option('--departure', default='08:00', help='Departure time (HH:MM format)')
 @click.option('--visualize', is_flag=True, help='Generate interactive map after calculation')
 @click.option('--map-output', default='isochrone_map.html', help='Output HTML file for map (if --visualize)')
-def query(db_path: str, address: str, lat: float, lon: float, max_time: int, date: str, departure: str, visualize: bool, map_output: str):
+@click.option('--verbose', is_flag=True, help='Print detailed line-following algorithm progress')
+def query(db_path: str, address: str, lat: float, lon: float, max_time: int, date: str, departure: str, visualize: bool, map_output: str, verbose: bool):
     """Find all stops reachable within the given time from an address or coordinates"""
     
     # Check if database exists
@@ -1496,22 +1609,48 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
             console.print(f"[red]Invalid departure time format: {departure}. Use HH:MM format.[/red]")
             return
         
+        # Handle date auto-selection and validation
+        if not date:
+            # Auto-select a good Tuesday
+            console.print("[cyan]No date specified, auto-selecting optimal date...[/cyan]")
+            date = find_good_tuesday(conn)
+            if not date:
+                console.print("[red]Could not find a suitable date in the database[/red]")
+                return
+            console.print(f"[green]Auto-selected date: {date}[/green]")
+        
         # Parse and validate date
-        from datetime import datetime
         try:
             date_obj = datetime.strptime(date, '%Y%m%d')
-            console.print(f"[dim]Date: {date_obj.strftime('%A, %B %d, %Y')}[/dim]")
-            console.print(f"[dim]Departure: {departure} ({start_time_seconds} seconds since midnight)[/dim]")
         except:
             console.print(f"[red]Invalid date format: {date}. Use YYYYMMDD format.[/red]")
             return
+        
+        # Check if date has coverage in database
+        if not validate_date_coverage(conn, date):
+            min_date, max_date = get_database_date_range(conn)
+            console.print(f"[red]⚠️  WARNING: No services found for {date} ({date_obj.strftime('%A, %B %d, %Y')})[/red]")
+            if min_date and max_date:
+                min_obj = datetime.strptime(min_date, '%Y%m%d')
+                max_obj = datetime.strptime(max_date, '%Y%m%d')
+                console.print(f"[yellow]Database covers: {min_obj.strftime('%B %d, %Y')} to {max_obj.strftime('%B %d, %Y')}[/yellow]")
+                
+                # Suggest a good alternative
+                good_date = find_good_tuesday(conn)
+                if good_date:
+                    good_obj = datetime.strptime(good_date, '%Y%m%d')
+                    console.print(f"[green]Suggestion: Use --date {good_date} ({good_obj.strftime('%A, %B %d, %Y')})[/green]")
+            return
+        
+        console.print(f"[dim]Date: {date_obj.strftime('%A, %B %d, %Y')}[/dim]")
+        console.print(f"[dim]Departure: {departure} ({start_time_seconds} seconds since midnight)[/dim]")
         
         # Use database-driven line-following algorithm
         console.print(f"\n[bold cyan]Using database-driven line-following algorithm for {date}[/bold cyan]")
         console.print("[dim]This approach uses targeted SQL queries instead of building graphs in memory[/dim]")
         
         reachable_stops = database_line_following_isochrone(
-            conn, optimized_walkable_stops, start_time_seconds, max_time, date
+            conn, optimized_walkable_stops, start_time_seconds, max_time, date, verbose=verbose
         )
         
         if not reachable_stops:
@@ -1593,6 +1732,248 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
         conn.close()
     
     console.print("\n[dim]Data © OpenStreetMap contributors[/dim]")
+
+
+@cli.command()
+@click.option('--vrr-db', default='data/vrr.db', help='Path to VRR database')
+@click.option('--delfi-db', default='data/delfi.db', help='Path to DELFI database')
+@click.option('--area', default='Dortmund', help='Focus area for comparison (city name)')
+@click.option('--radius', default=50, help='Radius in km around focus area')
+def compare_datasets(vrr_db: str, delfi_db: str, area: str, radius: int):
+    """Compare VRR and DELFI datasets to identify missing connections"""
+    
+    console.print(f"[bold blue]Comparing datasets for {area} area (±{radius}km)[/bold blue]")
+    
+    # Check if both databases exist
+    if not os.path.exists(vrr_db):
+        console.print(f"[red]VRR database not found: {vrr_db}[/red]")
+        return
+    if not os.path.exists(delfi_db):
+        console.print(f"[red]DELFI database not found: {delfi_db}[/red]")
+        return
+    
+    # Geocode the focus area
+    console.print(f"[cyan]Geocoding focus area: {area}[/cyan]")
+    coords = geocode_address(area)
+    if not coords:
+        console.print(f"[red]Could not geocode area: {area}[/red]")
+        return
+    
+    focus_lat, focus_lon = coords
+    console.print(f"[dim]Focus coordinates: {focus_lat:.4f}, {focus_lon:.4f}[/dim]")
+    
+    # Connect to both databases
+    vrr_conn = sqlite3.connect(vrr_db)
+    delfi_conn = sqlite3.connect(delfi_db)
+    
+    try:
+        # Get geographic bounds for filtering
+        lat_min = focus_lat - (radius / 111.0)  # Rough conversion: 1 degree ≈ 111km
+        lat_max = focus_lat + (radius / 111.0)
+        lon_min = focus_lon - (radius / (111.0 * abs(math.cos(math.radians(focus_lat)))))
+        lon_max = focus_lon + (radius / (111.0 * abs(math.cos(math.radians(focus_lat)))))
+        
+        console.print(f"[dim]Search bounds: {lat_min:.4f} to {lat_max:.4f}, {lon_min:.4f} to {lon_max:.4f}[/dim]")
+        
+        # Compare stop coverage
+        console.print(f"\n[cyan]Analyzing stop coverage...[/cyan]")
+        vrr_stops = get_stops_in_area(vrr_conn, lat_min, lat_max, lon_min, lon_max)
+        delfi_stops = get_stops_in_area(delfi_conn, lat_min, lat_max, lon_min, lon_max)
+        
+        console.print(f"[green]VRR stops in area: {len(vrr_stops)}[/green]")
+        console.print(f"[green]DELFI stops in area: {len(delfi_stops)}[/green]")
+        
+        # Find stops that exist in VRR but not in DELFI (by proximity)
+        missing_in_delfi = find_missing_stops(vrr_stops, delfi_stops, threshold_meters=100)
+        console.print(f"[yellow]Stops in VRR but missing/distant in DELFI: {len(missing_in_delfi)}[/yellow]")
+        
+        if missing_in_delfi:
+            console.print(f"\n[bold]Sample missing stops:[/bold]")
+            for i, stop in enumerate(missing_in_delfi[:10]):
+                console.print(f"  {i+1}. {stop['stop_name']} ({stop['stop_lat']:.4f}, {stop['stop_lon']:.4f})")
+            if len(missing_in_delfi) > 10:
+                console.print(f"  ... and {len(missing_in_delfi) - 10} more")
+        
+        # Compare route coverage
+        console.print(f"\n[cyan]Analyzing route coverage...[/cyan]")
+        vrr_routes = get_routes_in_area(vrr_conn, lat_min, lat_max, lon_min, lon_max)
+        delfi_routes = get_routes_in_area(delfi_conn, lat_min, lat_max, lon_min, lon_max)
+        
+        console.print(f"[green]VRR routes in area: {len(vrr_routes)}[/green]")
+        console.print(f"[green]DELFI routes in area: {len(delfi_routes)}[/green]")
+        
+        # Find routes that exist in VRR but not in DELFI
+        missing_routes = find_missing_routes(vrr_routes, delfi_routes)
+        console.print(f"[yellow]Routes in VRR but missing in DELFI: {len(missing_routes)}[/yellow]")
+        
+        if missing_routes:
+            console.print(f"\n[bold]Sample missing routes:[/bold]")
+            for i, route in enumerate(missing_routes[:10]):
+                route_name = route['route_short_name'] or route['route_long_name'] or route['route_id']
+                console.print(f"  {i+1}. {route_name} (Type: {route['route_type']})")
+            if len(missing_routes) > 10:
+                console.print(f"  ... and {len(missing_routes) - 10} more")
+        
+        # Connectivity analysis
+        console.print(f"\n[cyan]Testing connectivity between major stops...[/cyan]")
+        analyze_connectivity_differences(vrr_conn, delfi_conn, focus_lat, focus_lon, radius=20)
+        
+        # Summary
+        console.print(f"\n[bold blue]Summary for {area} area:[/bold blue]")
+        console.print(f"  Coverage gap: {len(missing_in_delfi)} stops, {len(missing_routes)} routes")
+        
+        coverage_percentage = (1 - len(missing_in_delfi) / max(len(vrr_stops), 1)) * 100
+        console.print(f"  DELFI stop coverage: {coverage_percentage:.1f}% of VRR stops")
+        
+        route_coverage_percentage = (1 - len(missing_routes) / max(len(vrr_routes), 1)) * 100
+        console.print(f"  DELFI route coverage: {route_coverage_percentage:.1f}% of VRR routes")
+        
+        if coverage_percentage < 80:
+            console.print(f"[yellow]⚠️  Significant coverage gap detected in DELFI dataset[/yellow]")
+        else:
+            console.print(f"[green]✓ Good coverage overlap between datasets[/green]")
+            
+    finally:
+        vrr_conn.close()
+        delfi_conn.close()
+
+
+def get_stops_in_area(conn: sqlite3.Connection, lat_min: float, lat_max: float, 
+                     lon_min: float, lon_max: float) -> List[Dict]:
+    """Get all stops within geographic bounds"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT stop_id, stop_name, stop_lat, stop_lon
+        FROM stops
+        WHERE stop_lat BETWEEN ? AND ? 
+        AND stop_lon BETWEEN ? AND ?
+    """, (lat_min, lat_max, lon_min, lon_max))
+    
+    return [{'stop_id': row[0], 'stop_name': row[1], 
+             'stop_lat': row[2], 'stop_lon': row[3]} for row in cursor.fetchall()]
+
+
+def get_routes_in_area(conn: sqlite3.Connection, lat_min: float, lat_max: float,
+                      lon_min: float, lon_max: float) -> List[Dict]:
+    """Get all routes that serve stops within geographic bounds"""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_type
+        FROM routes r
+        JOIN trips t ON r.route_id = t.route_id
+        JOIN stop_times st ON t.trip_id = st.trip_id
+        JOIN stops s ON st.stop_id = s.stop_id
+        WHERE s.stop_lat BETWEEN ? AND ?
+        AND s.stop_lon BETWEEN ? AND ?
+    """, (lat_min, lat_max, lon_min, lon_max))
+    
+    return [{'route_id': row[0], 'route_short_name': row[1],
+             'route_long_name': row[2], 'route_type': row[3]} for row in cursor.fetchall()]
+
+
+def find_missing_stops(vrr_stops: List[Dict], delfi_stops: List[Dict], 
+                      threshold_meters: float = 100) -> List[Dict]:
+    """Find VRR stops that don't have a close equivalent in DELFI"""
+    missing = []
+    
+    for vrr_stop in vrr_stops:
+        # Check if there's a DELFI stop within threshold distance
+        closest_distance = float('inf')
+        
+        for delfi_stop in delfi_stops:
+            distance = haversine_distance(
+                vrr_stop['stop_lat'], vrr_stop['stop_lon'],
+                delfi_stop['stop_lat'], delfi_stop['stop_lon']
+            ) * 1000  # Convert to meters
+            
+            if distance < closest_distance:
+                closest_distance = distance
+        
+        # If no DELFI stop is within threshold, consider it missing
+        if closest_distance > threshold_meters:
+            missing.append(vrr_stop)
+    
+    return missing
+
+
+def find_missing_routes(vrr_routes: List[Dict], delfi_routes: List[Dict]) -> List[Dict]:
+    """Find VRR routes that don't exist in DELFI by name/number"""
+    missing = []
+    
+    # Create set of DELFI route identifiers for fast lookup
+    delfi_identifiers = set()
+    for route in delfi_routes:
+        if route['route_short_name']:
+            delfi_identifiers.add(route['route_short_name'].strip())
+        if route['route_long_name']:
+            delfi_identifiers.add(route['route_long_name'].strip())
+    
+    for vrr_route in vrr_routes:
+        found = False
+        
+        # Check if VRR route exists in DELFI by short name or long name
+        if vrr_route['route_short_name']:
+            if vrr_route['route_short_name'].strip() in delfi_identifiers:
+                found = True
+        
+        if not found and vrr_route['route_long_name']:
+            if vrr_route['route_long_name'].strip() in delfi_identifiers:
+                found = True
+        
+        if not found:
+            missing.append(vrr_route)
+    
+    return missing
+
+
+def analyze_connectivity_differences(vrr_conn: sqlite3.Connection, delfi_conn: sqlite3.Connection,
+                                   focus_lat: float, focus_lon: float, radius: int = 20):
+    """Analyze connectivity differences between datasets for major stops"""
+    
+    # Find major stops in focus area (high connection count)
+    cursor = vrr_conn.cursor()
+    cursor.execute("""
+        SELECT s.stop_id, s.stop_name, s.stop_lat, s.stop_lon, 
+               COUNT(DISTINCT st.trip_id) as connection_count
+        FROM stops s
+        JOIN stop_times st ON s.stop_id = st.stop_id
+        WHERE s.stop_lat BETWEEN ? AND ?
+        AND s.stop_lon BETWEEN ? AND ?
+        GROUP BY s.stop_id, s.stop_name, s.stop_lat, s.stop_lon
+        HAVING connection_count > 50
+        ORDER BY connection_count DESC
+        LIMIT 10
+    """, (
+        focus_lat - radius/111.0, focus_lat + radius/111.0,
+        focus_lon - radius/111.0, focus_lon + radius/111.0
+    ))
+    
+    major_stops = cursor.fetchall()
+    
+    if not major_stops:
+        console.print("[yellow]No major stops found in focus area[/yellow]")
+        return
+    
+    console.print(f"[green]Found {len(major_stops)} major stops for connectivity testing[/green]")
+    
+    # Test connectivity between pairs of major stops
+    test_pairs = []
+    for i in range(min(3, len(major_stops))):
+        for j in range(i+1, min(3, len(major_stops))):
+            test_pairs.append((major_stops[i], major_stops[j]))
+    
+    console.print(f"[dim]Testing {len(test_pairs)} stop pairs...[/dim]")
+    
+    for stop1, stop2 in test_pairs:
+        stop1_name = stop1[1]
+        stop2_name = stop2[1]
+        
+        # For now, just report the stops - full routing comparison would be complex
+        console.print(f"  {stop1_name} ↔ {stop2_name}")
+        console.print(f"    VRR connections: {stop1[4]}, {stop2[4]}")
+        
+        # Could add: actual route finding and comparison here
+        # This would require implementing routing in both databases
 
 
 if __name__ == '__main__':
