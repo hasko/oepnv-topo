@@ -343,7 +343,9 @@ def optimize_walkable_stops_by_line_coverage(walkable_stops: List[Dict],
             stop['new_lines'] = new_lines
             stop['all_lines'] = stop_lines
     
+    reduction_percentage = ((len(walkable_stops) - len(selected_stops)) / len(walkable_stops)) * 100
     console.print(f"[green]Line coverage optimization: {len(walkable_stops)} → {len(selected_stops)} stops[/green]")
+    console.print(f"[dim]Reduction: {len(walkable_stops) - len(selected_stops)} stops eliminated ({reduction_percentage:.1f}% fewer origins)[/dim]")
     console.print(f"[dim]Covers {len(covered_lines)} unique lines/routes[/dim]")
     
     # Show first few selected stops with their line contributions
@@ -356,6 +358,8 @@ def optimize_walkable_stops_by_line_coverage(walkable_stops: List[Dict],
     
     if len(selected_stops) > 5:
         console.print(f"  ... and {len(selected_stops) - 5} more stops")
+    
+    console.print(f"[green]✓ Optimized origins: Using {len(selected_stops)} stops instead of {len(walkable_stops)} for routing[/green]")
     
     return selected_stops
 

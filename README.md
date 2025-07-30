@@ -32,8 +32,13 @@ Requires Python 3.11+ and uv for dependency management:
 # Clone repository and install dependencies
 uv sync
 
-# Initialize database from GTFS data (requires ./data folder with VRR files)
-uv run python main.py init
+# Download GTFS data from https://www.opendata-oepnv.de
+# Extract to ./data folder (e.g., ./data/vrr/ or ./data/delfi/)
+
+# Initialize database from GTFS data
+uv run python main.py init --data-dir data/vrr    # For VRR regional data
+# or
+uv run python main.py init --data-dir data/delfi  # For Germany-wide data
 ```
 
 ## Usage
@@ -85,13 +90,22 @@ uv run python main.py visualize --address "Köln Hauptbahnhof" --time 25 --simpl
 
 ## Data
 
-The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
-- `stops.csv` - 34k+ transit stops with coordinates
-- `routes.csv` - 1.8k+ transit routes (bus, tram, S-Bahn, etc.)
-- `trips.csv` - 247k+ individual trips
-- `stop_times.csv` - 5.7M+ scheduled stops with times
-- `transfers.csv` - 78k+ transfer connections
-- Additional German-specific files (`haltestellen.csv`, `linien.csv`)
+The tool uses GTFS (General Transit Feed Specification) data from German public transport providers. You can download the data from:
+
+**OpenData ÖPNV**: https://www.opendata-oepnv.de
+
+The `./data` folder should contain GTFS files such as:
+- `stops.txt/csv` - Transit stops with coordinates
+- `routes.txt/csv` - Transit routes (bus, tram, S-Bahn, etc.)
+- `trips.txt/csv` - Individual trips
+- `stop_times.txt/csv` - Scheduled stops with times
+- `transfers.txt/csv` - Transfer connections
+- `calendar.txt/csv` - Service schedules
+- `calendar_dates.txt/csv` - Service exceptions
+
+Example datasets:
+- **VRR (Rhein-Ruhr)**: ~34k stops, 1.8k routes, 247k trips, 5.7M stop times
+- **DELFI (Germany-wide)**: Much larger dataset covering all of Germany
 
 ## Technical Details
 
@@ -102,13 +116,15 @@ The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
 - **On-demand graphs**: Builds optimized network per query instead of global graph
 - **Geocoding cache**: Avoids repeated address lookups
 
-### Algorithm
+### Database-Driven Algorithm Steps
 
-1. Geocode starting address using OpenStreetMap/Nominatim
-2. Filter stops to those within reachable distance 
-3. Build directed graph with transit connections and transfer times
-4. Run Dijkstra's algorithm to find shortest paths within time limit
-5. Group and display results by travel time ranges
+1. **Geocode** starting address using OpenStreetMap/Nominatim
+2. **Find walkable stops** within 20-minute walk of origin
+3. **Optimize origins** using line coverage analysis (reduces redundancy)
+4. **Line following** using SQL queries to explore transit routes
+5. **Time window filtering** to only consider relevant trips
+6. **Transfer handling** with realistic transfer times
+7. **Walking expansion** around reachable transit stops
 
 ### Enhanced Walking Model
 
@@ -141,46 +157,38 @@ The `./data` folder contains VRR (Verkehrsverbund Rhein-Ruhr) GTFS files:
 - **✅ Detailed progress reporting**: Shows connection processing, filtering, and graph statistics
 - **✅ GitHub Pages Compatible**: Generated maps are static HTML files ready for web deployment
 
-### Algorithm Options
+### Algorithm
 
-The tool now supports two routing algorithms:
-
-1. **Graph-Based Routing** (default): Builds time-dependent graph with all possible connections
-   - More conservative: ~190 reachable stops from Dortmund TU in 30 minutes
-   - Slower: ~56 seconds for computation
-   - Higher memory usage due to graph construction
-
-2. **Database-Driven Line Following** (experimental): Uses SQL queries to follow transit lines
-   - More comprehensive: ~343 reachable stops from Dortmund TU in 30 minutes  
-   - **3.3x faster**: ~17 seconds for computation
-   - Memory efficient: No graph construction needed
-   - Enable with `--database-driven` flag
+The tool uses a **database-driven line-following algorithm** that:
+- Uses targeted SQL queries instead of building graphs in memory
+- Finds comprehensive results: ~343 reachable stops from Dortmund TU in 30 minutes  
+- **Fast computation**: ~17 seconds (3.3x faster than previous graph approach)
+- **Memory efficient**: No graph construction needed
+- **Time window optimization**: Only considers trips within the analysis window
 
 ```bash
-# Use faster database-driven algorithm
-uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --database-driven
+# Query with database-driven algorithm (default and only option)
+uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30
 ```
 
 ### Recent Improvements (2025-01)
 
-- **✅ Database-driven line-following algorithm**: 3.3x faster alternative routing approach
+- **✅ Simplified codebase**: Removed graph-based algorithm, database-driven is now the only option
+- **✅ Database-driven line-following**: 3.3x faster than previous graph approach
+- **✅ Time window optimization**: SQL queries only consider trips within analysis window
 - **✅ Schedule-based routing**: Uses actual GTFS timetables instead of estimates
 - **✅ Calendar validation**: Only includes services running on specific dates
 - **✅ Circle Union Visualization**: Precise circular walking areas based on remaining time
 - **✅ Human-Readable Line Names**: Shows passenger-friendly names (447, U43, S1)
 - **✅ Enhanced Transit Stop Markers**: Interactive markers with travel times and lines
-- **✅ Fixed walking time bug**: End walking time correctly calculated
-- **✅ Enhanced route connectivity**: All bus and train lines properly connected
-- **✅ Eliminated wait times for same-route connections**: No delays when staying on vehicle
-- **✅ Added transfer penalties**: 5-minute penalty only when changing routes
-- **✅ Direction filtering**: Prevents inefficient U-turns
+- **✅ Memory efficiency**: No graph construction overhead
 - **✅ GitHub Pages Compatible**: Static HTML files ready for web deployment
 
 ### Current Limitations
 
-- No real-time data integration
+- No real-time data integration (uses static GTFS schedules)
 - Walking connections between stops limited by performance thresholds
-- Database-driven algorithm is experimental and may find slightly different results
+- Requires manual download of GTFS data from providers
 
 ## Next Steps
 
