@@ -1,0 +1,4 @@
+Emil-Figge-Str. 42, Dortmund; Karl-Schwartz-Str. 4, Dortmund; 27
+Emil-Figge-Str. 42, Dortmund; Frankfurter Weg 4, Holzwickede; 54
+Emil-Figge-Str. 42, Dortmund; Rheinische Str. 82, Dortmund; 31
+Emil-Figge-Str. 42, Dortmund; Bochum Hbf; 23

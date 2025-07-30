@@ -454,7 +454,7 @@ def create_circle_union_map(
     center_lon: float,
     union_polygons: Dict[str, Polygon],
     reachable_stops: Dict[str, Dict],
-    graph,
+    conn,
     stop_lines_mapping: Dict[str, set] = None,
     title: str = "Circle Union Isochrone",
     output_file: str = "circle_union_map.html"
@@ -549,13 +549,15 @@ def create_circle_union_map(
     
     # Add individual transit stops as markers
     transit_stops = 0
+    cursor = conn.cursor()
+    
     for stop_id, stop_info in reachable_stops.items():
-        # Get coordinates from graph and travel time from stop info
-        if graph.has_node(stop_id):
-            stop_data = graph.nodes[stop_id]
-            lat = stop_data.get('lat')
-            lon = stop_data.get('lon')
-            stop_name = stop_data.get('name', f'Stop {stop_id}')
+        # Get coordinates from database
+        cursor.execute("SELECT stop_lat, stop_lon, stop_name FROM stops WHERE stop_id = ?", (stop_id,))
+        stop_data = cursor.fetchone()
+        
+        if stop_data:
+            lat, lon, stop_name = stop_data
             travel_time = stop_info.get('total_time_minutes', 0)
             
             # Get line information if available

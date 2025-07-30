@@ -28,31 +28,47 @@ The project uses Python 3.11 with uv for dependency management. Key dependencies
 - `geopandas` - Geographic data processing and spatial operations
 - `alphashape` - Creating realistic polygon boundaries from point data
 
+## Available Datasets
+
+Two datasets are available in the `data/` folder:
+
+### VRR Dataset (`data/vrr/`)
+- **Coverage**: VRR region (Ruhr area) 
+- **Size**: 602MB, ~6.7M records
+- **Files**: `.csv` format with German-specific `haltestellen.csv`, `linien.csv`
+- **Performance**: Fast, 374 stops reachable in 30min from Emil-Figge-Str
+
+### DELFI Dataset (`data/delfi/`)
+- **Coverage**: All of Germany (~1,167 agencies)
+- **Size**: 3.4GB, ~50.6M records  
+- **Files**: `.txt` format (GTFS standard)
+- **Period**: July 5 - December 13, 2025
+- **Performance**: Slower due to scale, requires optimization
+
 ## Commands
 
 ```bash
-# Initialize database from GTFS data (includes calendar tables)
-uv run python main.py init
+# Initialize database from specific dataset folder
+uv run python main.py init --data-dir data/vrr     # VRR regional data
+uv run python main.py init --data-dir data/delfi   # Germany-wide data
 
 # Show database statistics and example queries
 uv run python main.py stats
 
-# Find reachable stops using actual GTFS schedules (default: April 7, 2025 at 8am)
-uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30
-uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20
+# Find reachable stops using database-driven algorithm
+# VRR dataset: use dates in April 2025
+uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30 --date 20250407
+uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20 --date 20250407
 
-# Use faster database-driven algorithm (3.3x speedup)
-uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --database-driven
+# DELFI dataset: use dates July-December 2025
+uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --date 20250728
 
-# Specify custom date and departure time
-uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --date 20250407 --departure 08:00
+# Specify custom departure time  
+uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30 --date 20250728 --departure 08:00
 
 # Generate interactive maps with schedule-based isochrone visualization
 uv run python main.py query --address "Düsseldorf Hauptbahnhof" --time 30 --visualize
 uv run python main.py query --lat 51.2197 --lon 6.7943 --time 20 --visualize --map-output custom_map.html
-
-# Combine database-driven algorithm with visualization
-uv run python main.py query --address "Dortmund Hauptbahnhof" --time 25 --database-driven --visualize
 
 # Visualize existing results
 uv run python main.py visualize --address "Düsseldorf Hauptbahnhof" --time 30
@@ -115,13 +131,15 @@ uv run python main.py visualize --address "Düsseldorf Hauptbahnhof" --time 30
 - Transfer optimization: Uses GTFS transfer data with realistic penalties
 - Detailed progress reporting: Shows filtering, processing, and graph statistics
 
-**Database-Driven Algorithm (NEW):**
-- **3.3x faster**: 17 seconds vs 56 seconds for graph-based approach
-- **More comprehensive**: Finds 343 stops vs 190 with graph approach
+**Database-Driven Algorithm:**
+- **Default algorithm**: The only routing algorithm in this branch
+- **3.3x faster**: 17 seconds vs 56 seconds (compared to previous graph approach)
+- **More comprehensive**: Finds 343 stops vs 190
 - **Memory efficient**: No graph construction overhead
 - **Simple logic**: Uses visited tracking and SQL queries
 - **Line following**: Queries entire trip routes with single SQL call
 - **Service filtering**: Uses calendar_dates table for active trips
+- **Time window optimization**: Only considers trips within analysis window
 
 **Real-World Accuracy:**
 - **Düsseldorf Hbf**: 771 reachable stops (schedule-based) vs 2,557 (estimates) 
