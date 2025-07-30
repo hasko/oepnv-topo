@@ -233,6 +233,33 @@ def is_service_active_on_date(conn: sqlite3.Connection, service_id: str, date_st
     return bool(result and result[0] == 1)
 
 
+def get_active_service_ids_for_date(conn: sqlite3.Connection, date_str: str) -> List[str]:
+    """
+    Get all service IDs that are active on a specific date.
+    Combines both calendar (regular schedule) and calendar_dates (exceptions) logic.
+    
+    Args:
+        conn: Database connection
+        date_str: Date in YYYYMMDD format (e.g., '20250730')
+    
+    Returns:
+        List of active service_ids for the given date
+    """
+    cursor = conn.cursor()
+    
+    # First, get all service_ids that exist
+    cursor.execute("SELECT DISTINCT service_id FROM trips")
+    all_service_ids = [row[0] for row in cursor.fetchall()]
+    
+    active_service_ids = []
+    
+    for service_id in all_service_ids:
+        if is_service_active_on_date(conn, service_id, date_str):
+            active_service_ids.append(service_id)
+    
+    return active_service_ids
+
+
 def get_active_trips_on_date(conn: sqlite3.Connection, date_str: str) -> List[str]:
     """
     Get all trip IDs that are active on a specific date
@@ -359,14 +386,45 @@ def find_walkable_stops(conn: sqlite3.Connection, start_lat: float, start_lon: f
     return walkable_stops
 
 
+def get_route_mappings(conn: sqlite3.Connection) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Create robust route mappings using GTFS unique identifiers
+    
+    Returns:
+        - route_name_to_id: {route_short_name -> route_id}  
+        - route_id_to_name: {route_id -> route_short_name}
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT route_id, route_short_name, route_long_name
+        FROM routes 
+        WHERE route_short_name IS NOT NULL AND route_short_name != ''
+    """)
+    
+    name_to_id = {}
+    id_to_name = {}
+    
+    for route_id, short_name, long_name in cursor.fetchall():
+        # Primary mapping: short_name -> route_id
+        name_to_id[short_name] = route_id
+        id_to_name[route_id] = short_name
+        
+        # Secondary mapping: long_name -> route_id (if different)
+        if long_name and long_name != short_name:
+            name_to_id[long_name] = route_id
+    
+    return name_to_id, id_to_name
+
+
 def get_stop_lines_mapping(conn: sqlite3.Connection) -> Dict[str, set]:
     """
     Create mapping of stop_id -> set of human-readable route short names (like "447", "U43", "X13")
     This is used for line coverage optimization and display
+    Uses route_id joins for robustness, route_short_name only for display
     """
     cursor = conn.cursor()
     
-    # Query to find which routes serve each stop, getting human-readable route short names
+    # Query using route_id (unique key) joins, route_short_name only for display
     query = """
     SELECT DISTINCT st.stop_id, r.route_short_name as line_name
     FROM stop_times st
@@ -387,6 +445,66 @@ def get_stop_lines_mapping(conn: sqlite3.Connection) -> Dict[str, set]:
         stop_lines[stop_id].add(line_name)
     
     return stop_lines
+
+
+def suggest_alternative_dates_for_route(conn: sqlite3.Connection, route_name: str, 
+                                       target_date: str, days_range: int = 7) -> List[str]:
+    """
+    When a route isn't running on target date, suggest nearby dates when it is active
+    
+    Args:
+        route_name: Route short name (e.g., "S1")
+        target_date: Date in YYYYMMDD format
+        days_range: How many days before/after to check
+    
+    Returns:
+        List of dates in YYYYMMDD format when route is active
+    """
+    cursor = conn.cursor()
+    
+    # Get route_id from name
+    route_mappings, _ = get_route_mappings(conn)
+    route_id = route_mappings.get(route_name)
+    
+    if not route_id:
+        return []
+    
+    # Convert target date to check nearby dates
+    from datetime import datetime, timedelta
+    try:
+        target_dt = datetime.strptime(target_date, '%Y%m%d')
+    except ValueError:
+        return []
+    
+    alternative_dates = []
+    
+    # Check days before and after target date
+    for days_offset in range(-days_range, days_range + 1):
+        if days_offset == 0:
+            continue  # Skip target date (we know it doesn't work)
+            
+        check_date = target_dt + timedelta(days=days_offset)
+        check_date_str = check_date.strftime('%Y%m%d')
+        
+        # Check if route is active on this date using proper calendar validation
+        active_service_ids = get_active_service_ids_for_date(conn, check_date_str)
+        if not active_service_ids:
+            continue  # No services active on this date
+        
+        # Convert service_ids to SQL IN clause
+        service_placeholders = ','.join(['?'] * len(active_service_ids))
+        cursor.execute(f"""
+            SELECT COUNT(*) as active_trips
+            FROM trips t 
+            WHERE t.route_id = ?
+              AND t.service_id IN ({service_placeholders})
+        """, [route_id] + active_service_ids)
+        
+        result = cursor.fetchone()
+        if result and result[0] > 0:
+            alternative_dates.append(check_date_str)
+    
+    return alternative_dates
 
 
 def optimize_walkable_stops_by_line_coverage(walkable_stops: List[Dict], 
@@ -654,7 +772,14 @@ def query_departing_trips_simple(conn: sqlite3.Connection, stop_id: str,
     # Use numeric time comparison to handle both zero-padded (08:00:00) and single-digit (8:00:00) formats
     # First get all potential departures, then filter by time in Python for robustness
     
-    query = """
+    # Get active service IDs for proper calendar validation
+    active_service_ids = get_active_service_ids_for_date(conn, date_str)
+    if not active_service_ids:
+        return []  # No services active on this date
+    
+    # Build query with proper service filtering
+    service_placeholders = ','.join(['?'] * len(active_service_ids))
+    query = f"""
     SELECT DISTINCT
         st.trip_id,
         st.departure_time,
@@ -664,10 +789,7 @@ def query_departing_trips_simple(conn: sqlite3.Connection, stop_id: str,
     JOIN trips t ON st.trip_id = t.trip_id
     JOIN routes r ON t.route_id = r.route_id
     WHERE st.stop_id = ?
-      AND t.service_id IN (
-          SELECT service_id FROM calendar_dates 
-          WHERE date = ? AND exception_type = 1
-      )
+      AND t.service_id IN ({service_placeholders})
       AND EXISTS (
           -- Ensure trip has at least one stop within our time window
           SELECT 1 FROM stop_times st2
@@ -676,7 +798,7 @@ def query_departing_trips_simple(conn: sqlite3.Connection, stop_id: str,
     ORDER BY st.departure_time
     """
     
-    params = [stop_id, date_str]
+    params = [stop_id] + active_service_ids
     cursor.execute(query, params)
     
     # Filter results by time window using numeric comparison
@@ -1667,40 +1789,78 @@ def debug(db_path: str, route: str, stop: str, address1: str, address2: str):
         if route:
             console.print(f"[cyan]Searching for route/line: {route}[/cyan]")
             
-            # Search in routes table
-            cursor.execute("""
-                SELECT route_id, route_short_name, route_long_name, route_type 
-                FROM routes 
-                WHERE route_short_name LIKE ? OR route_long_name LIKE ? OR route_id LIKE ?
-            """, (f'%{route}%', f'%{route}%', f'%{route}%'))
+            # Use robust route mapping
+            route_mappings, reverse_mappings = get_route_mappings(conn)
             
-            routes = cursor.fetchall()
-            if routes:
-                console.print(f"[green]Found {len(routes)} matching routes:[/green]")
-                for route_id, short_name, long_name, route_type in routes:
-                    console.print(f"  • {short_name or 'N/A'} - {long_name or 'N/A'} (ID: {route_id}, Type: {route_type})")
+            # Try exact match first
+            route_id = route_mappings.get(route)
+            if route_id:
+                console.print(f"[green]Found exact match: {route} -> {route_id}[/green]")
+                routes_to_check = [(route_id, route)]
+            else:
+                # Fallback to pattern matching
+                cursor.execute("""
+                    SELECT route_id, route_short_name, route_long_name, route_type 
+                    FROM routes 
+                    WHERE route_short_name LIKE ? OR route_long_name LIKE ? OR route_id LIKE ?
+                """, (f'%{route}%', f'%{route}%', f'%{route}%'))
                 
-                # For each route, find stops
-                for route_id, short_name, long_name, route_type in routes[:3]:  # Limit to first 3
-                    console.print(f"\n[cyan]Stops for route {short_name or route_id}:[/cyan]")
+                routes = cursor.fetchall()
+                if routes:
+                    console.print(f"[green]Found {len(routes)} matching routes via pattern search:[/green]")
+                    routes_to_check = [(r[0], r[1] or r[0]) for r in routes[:3]]
+                    for route_id, short_name, long_name, route_type in routes:
+                        console.print(f"  • {short_name or 'N/A'} - {long_name or 'N/A'} (ID: {route_id}, Type: {route_type})")
+                else:
+                    console.print(f"[yellow]No routes found matching '{route}'[/yellow]")
+                    console.print(f"[dim]Available routes: {', '.join(sorted(route_mappings.keys())[:10])}...[/dim]")
+                    routes_to_check = []
+            
+            # For each route, find stops and check service dates
+            for route_id, route_name in routes_to_check:
+                console.print(f"\n[cyan]Stops for route {route_name} (ID: {route_id}):[/cyan]")
+                cursor.execute("""
+                    SELECT DISTINCT s.stop_id, s.stop_name, s.stop_lat, s.stop_lon
+                    FROM stops s
+                    JOIN stop_times st ON s.stop_id = st.stop_id
+                    JOIN trips t ON st.trip_id = t.trip_id
+                    WHERE t.route_id = ?
+                    ORDER BY s.stop_name
+                    LIMIT 10
+                """, (route_id,))
+                
+                route_stops = cursor.fetchall()
+                for stop_id, stop_name, lat, lon in route_stops:
+                    console.print(f"    {stop_name} ({lat:.4f}, {lon:.4f})")
+                
+                if len(route_stops) > 10:
                     cursor.execute("""
-                        SELECT DISTINCT s.stop_id, s.stop_name, s.stop_lat, s.stop_lon
+                        SELECT COUNT(DISTINCT s.stop_id)
                         FROM stops s
                         JOIN stop_times st ON s.stop_id = st.stop_id
                         JOIN trips t ON st.trip_id = t.trip_id
                         WHERE t.route_id = ?
-                        ORDER BY s.stop_name
-                        LIMIT 10
                     """, (route_id,))
+                    total_stops = cursor.fetchone()[0]
+                    console.print(f"    ... and {total_stops - 10} more stops (total: {total_stops})")
+                
+                # Check service information for this route
+                cursor.execute("""
+                    SELECT DISTINCT t.service_id
+                    FROM trips t
+                    WHERE t.route_id = ?
+                """, (route_id,))
+                
+                service_ids = [row[0] for row in cursor.fetchall()]
+                if service_ids:
+                    console.print(f"    [dim]Service IDs: {', '.join(service_ids)}[/dim]")
                     
-                    route_stops = cursor.fetchall()
-                    for stop_id, stop_name, lat, lon in route_stops:
-                        console.print(f"    {stop_name} ({lat:.4f}, {lon:.4f})")
-                    
-                    if len(route_stops) > 10:
-                        console.print(f"    ... and {len(route_stops) - 10} more stops")
-            else:
-                console.print(f"[yellow]No routes found matching '{route}'[/yellow]")
+                    # Check if route runs on July 30, 2025
+                    july30_active = any(is_service_active_on_date(conn, sid, '20250730') for sid in service_ids)
+                    status = "✓ ACTIVE" if july30_active else "✗ INACTIVE"
+                    console.print(f"    [dim]July 30, 2025: {status}[/dim]")
+                else:
+                    console.print(f"    [yellow]No service IDs found for this route[/yellow]")
         
         if stop:
             console.print(f"\n[cyan]Searching for stop: {stop}[/cyan]")
