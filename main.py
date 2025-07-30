@@ -607,7 +607,7 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
     
     console.print(f"[cyan]Database line-following from {len(walkable_stops)} walkable stops...[/cyan]")
     console.print(f"[dim]Time window: {seconds_to_time_str(start_time_seconds)} - {seconds_to_time_str(end_time_seconds)}[/dim]")
-    console.print(f"[dim]Date: {date_str} (service filtering applied in SQL queries)[/dim]")
+    console.print(f"[dim]Date: {date_str}[/dim]")
     
     # Track visited stops with earliest arrival time
     visited = {}  # stop_id -> earliest_arrival_time_seconds
@@ -667,7 +667,7 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
             # Add to results
             reachable_stops[current_stop] = {
                 'arrival_time': arrival_time,
-                'total_time': total_time_minutes
+                'total_time_minutes': total_time_minutes
             }
             
             # Find all trips departing from this stop after we arrive
@@ -2034,7 +2034,6 @@ def query(db_path: str, address: str, lat: float, lon: float, max_time: int, dat
         
         # Use database-driven line-following algorithm
         console.print(f"\n[bold cyan]Using database-driven line-following algorithm for {date}[/bold cyan]")
-        console.print("[dim]This approach uses targeted SQL queries instead of building graphs in memory[/dim]")
         
         reachable_stops = database_line_following_isochrone(
             conn, optimized_walkable_stops, start_time_seconds, max_time, date, verbose=verbose

@@ -431,6 +431,12 @@ def create_circle_union_map(
         if stop_data:
             lat, lon, stop_name = stop_data
             travel_time = stop_info.get('total_time_minutes', 0)
+            arrival_time_seconds = stop_info.get('arrival_time', 0)
+            
+            # Convert arrival time seconds to HH:MM format
+            hours = arrival_time_seconds // 3600
+            minutes = (arrival_time_seconds % 3600) // 60
+            arrival_time_str = f"{hours:02d}:{minutes:02d}"
             
             # Get line information if available
             lines_info = ""
@@ -444,8 +450,8 @@ def create_circle_union_map(
                         lines_info = f"<br>Lines: {', '.join(lines[:4])} (+{len(lines)-4} more)"
             
             if lat is not None and lon is not None:
-                # Create tooltip text with line information
-                tooltip_text = f"{stop_name} ({travel_time:.1f}min)"
+                # Create tooltip text with arrival time and line information
+                tooltip_text = f"{stop_name} (arr. {arrival_time_str})"
                 if lines_info:
                     # Extract just the line names for tooltip (no HTML)
                     lines_for_tooltip = sorted(list(stop_lines_mapping[stop_id])) if stop_lines_mapping and stop_id in stop_lines_mapping else []
@@ -458,7 +464,7 @@ def create_circle_union_map(
                 folium.CircleMarker(
                     [lat, lon],
                     radius=4,
-                    popup=f"{stop_name}<br>Travel time: {travel_time:.1f} min{lines_info}",
+                    popup=f"{stop_name}<br>Arrival: {arrival_time_str}<br>Travel time: {travel_time:.1f} min{lines_info}",
                     tooltip=tooltip_text,
                     color='darkblue',
                     fillColor='lightblue',
