@@ -568,11 +568,8 @@ def query_departing_trips_simple(conn: sqlite3.Connection, stop_id: str,
     """Find trips departing from a stop within time window"""
     cursor = conn.cursor()
     
-    # Convert to time strings
-    earliest_str = seconds_to_time_str(earliest_departure)
-    latest_str = seconds_to_time_str(latest_departure)
-    
-    # Use service-based filtering which is more efficient than trip-level
+    # Use numeric time comparison to handle both zero-padded (08:00:00) and single-digit (8:00:00) formats
+    # First get all potential departures, then filter by time in Python for robustness
     
     query = """
     SELECT DISTINCT
@@ -584,8 +581,6 @@ def query_departing_trips_simple(conn: sqlite3.Connection, stop_id: str,
     JOIN trips t ON st.trip_id = t.trip_id
     JOIN routes r ON t.route_id = r.route_id
     WHERE st.stop_id = ?
-      AND st.departure_time >= ?
-      AND st.departure_time <= ?
       AND t.service_id IN (
           SELECT service_id FROM calendar_dates 
           WHERE date = ? AND exception_type = 1
@@ -594,21 +589,28 @@ def query_departing_trips_simple(conn: sqlite3.Connection, stop_id: str,
           -- Ensure trip has at least one stop within our time window
           SELECT 1 FROM stop_times st2
           WHERE st2.trip_id = st.trip_id
-          AND st2.arrival_time <= ?
       )
     ORDER BY st.departure_time
-    LIMIT 100
     """
     
-    params = [stop_id, earliest_str, latest_str, date_str, latest_str]
+    params = [stop_id, date_str]
     cursor.execute(query, params)
     
+    # Filter results by time window using numeric comparison
     results = []
     for trip_id, dep_time_str, stop_seq, route_name in cursor.fetchall():
-        dep_time_seconds = time_str_to_seconds(dep_time_str)
-        results.append((trip_id, dep_time_seconds, stop_seq, route_name))
+        try:
+            dep_time_seconds = time_str_to_seconds(dep_time_str)
+            # Only include departures within our time window
+            if earliest_departure <= dep_time_seconds <= latest_departure:
+                results.append((trip_id, dep_time_seconds, stop_seq, route_name))
+        except (ValueError, AttributeError):
+            # Skip invalid time formats
+            continue
     
-    return results
+    # Limit results and sort by departure time
+    results.sort(key=lambda x: x[1])  # Sort by departure time (seconds)
+    return results[:100]
 
 
 def query_all_stops_on_trip(conn: sqlite3.Connection, trip_id: str,
@@ -616,23 +618,27 @@ def query_all_stops_on_trip(conn: sqlite3.Connection, trip_id: str,
     """Get all downstream stops on a trip"""
     cursor = conn.cursor()
     
-    before_time_str = seconds_to_time_str(before_time)
-    
+    # Get all stops on trip after the boarding sequence, then filter by time in Python
     query = """
     SELECT stop_id, arrival_time
     FROM stop_times
     WHERE trip_id = ?
       AND stop_sequence > ?
-      AND arrival_time <= ?
     ORDER BY stop_sequence
     """
     
-    cursor.execute(query, (trip_id, after_sequence, before_time_str))
+    cursor.execute(query, (trip_id, after_sequence))
     
     results = []
     for stop_id, arrival_str in cursor.fetchall():
-        arrival_seconds = time_str_to_seconds(arrival_str)
-        results.append((stop_id, arrival_seconds))
+        try:
+            arrival_seconds = time_str_to_seconds(arrival_str)
+            # Only include stops we can reach within our time limit
+            if arrival_seconds <= before_time:
+                results.append((stop_id, arrival_seconds))
+        except (ValueError, AttributeError):
+            # Skip invalid time formats
+            continue
     
     return results
 
@@ -911,11 +917,22 @@ def add_schedule_based_walking_expansion(reachable_stops: Dict[str, Dict], conn:
 
 def parse_gtfs_time(time_str: str) -> int:
     """
-    Parse GTFS time format (HH:MM:SS) to seconds since midnight
+    Parse GTFS time format (HH:MM:SS or H:MM:SS) to seconds since midnight
     Handles times > 24:00:00 for trips that span midnight
+    Supports both zero-padded (08:00:00) and single-digit (8:00:00) formats
     """
+    if not time_str or time_str.strip() == '':
+        return 0
     hours, mins, secs = map(int, time_str.split(':'))
     return hours * 3600 + mins * 60 + secs
+
+
+def time_str_to_seconds(time_str: str) -> int:
+    """
+    Convert time string (HH:MM:SS or H:MM:SS) to seconds since midnight
+    Handles both zero-padded and single-digit hour formats
+    """
+    return parse_gtfs_time(time_str)
 
 
 def seconds_to_time_str(seconds: int) -> str:
