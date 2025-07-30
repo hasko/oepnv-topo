@@ -195,3 +195,28 @@ uv run python main.py query --address "Emil-Figge-Str. 42, Dortmund" --time 30
 - **Export options**: GeoJSON, KML for use in mapping applications
 - **Multi-modal routing**: Combine walking, cycling, and transit
 - **Spatial indexing**: R-tree optimization for walking connections
+
+## Attribution
+
+This project uses the following open-source libraries and data sources:
+
+### Libraries
+- **[Folium](https://github.com/python-visualization/folium)** - Interactive map visualization (BSD-3-Clause)
+- **[GeoPandas](https://github.com/geopandas/geopandas)** - Geographic data processing (BSD-3-Clause)
+- **[Shapely](https://github.com/shapely/shapely)** - Geometric analysis (BSD-3-Clause)
+- **[Pandas](https://github.com/pandas-dev/pandas)** - Data analysis (BSD-3-Clause)
+- **[Click](https://github.com/pallets/click)** - Command-line interface (BSD-3-Clause)
+- **[Rich](https://github.com/Textualize/rich)** - Terminal formatting (MIT)
+- **[AlphaShape](https://github.com/bellockk/alphashape)** - Concave hull generation (MIT)
+- **[PyProj](https://github.com/pyproj4/pyproj)** - Cartographic projections (MIT)
+- **[NetworkX](https://github.com/networkx/networkx)** - Graph algorithms (BSD-3-Clause)
+- **[GeoPy](https://github.com/geopy/geopy)** - Geocoding (MIT)
+
+### Data Sources
+- **[OpenStreetMap](https://www.openstreetmap.org/copyright)** - Map tiles and geocoding data (© OpenStreetMap contributors, ODbL)
+- **[VRR GTFS Data](https://www.opendata-oepnv.de)** - Public transport schedules for Rhine-Ruhr region
+- **[HVV GTFS Data](https://www.opendata-oepnv.de)** - Public transport schedules for Hamburg region
+- **[DELFI GTFS Data](https://www.opendata-oepnv.de)** - Germany-wide public transport schedules
+
+### Map Visualization
+Maps are generated using Folium with OpenStreetMap tiles. All interactive maps include proper attribution as required by the OpenStreetMap license.
