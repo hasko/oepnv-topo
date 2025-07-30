@@ -254,8 +254,20 @@ def find_walkable_stops(conn: sqlite3.Connection, start_lat: float, start_lon: f
     """
     max_walk_distance_km = (max_walk_time_minutes / 60.0) * 5.0  # 5 km/h walking speed
     
+    # Add geographic bounds to avoid issues with distant coordinates in international datasets
+    # Use a reasonable bounding box around the start point (±2 degrees ≈ ±200km)
+    lat_min = start_lat - 2.0
+    lat_max = start_lat + 2.0  
+    lon_min = start_lon - 2.0
+    lon_max = start_lon + 2.0
+    
     cursor = conn.cursor()
-    cursor.execute("SELECT stop_id, stop_name, stop_lat, stop_lon FROM stops")
+    cursor.execute("""
+        SELECT stop_id, stop_name, stop_lat, stop_lon 
+        FROM stops 
+        WHERE stop_lat BETWEEN ? AND ? 
+        AND stop_lon BETWEEN ? AND ?
+    """, (lat_min, lat_max, lon_min, lon_max))
     
     walkable_stops = []
     for stop_id, stop_name, stop_lat, stop_lon in cursor.fetchall():
@@ -536,13 +548,14 @@ def database_line_following_isochrone(conn: sqlite3.Connection,
                                 
                                 # Get routes/lines available at this transfer stop
                                 cursor.execute("""
-                                    SELECT DISTINCT r.route_short_name
+                                    SELECT DISTINCT 
+                                        COALESCE(r.route_short_name, r.route_long_name, r.route_id) as route_name
                                     FROM routes r
                                     JOIN trips t ON r.route_id = t.route_id
                                     JOIN stop_times st ON t.trip_id = st.trip_id
                                     WHERE st.stop_id = ?
-                                    AND r.route_short_name IS NOT NULL
-                                    ORDER BY r.route_short_name
+                                    AND COALESCE(r.route_short_name, r.route_long_name, r.route_id) IS NOT NULL
+                                    ORDER BY route_name
                                     LIMIT 10
                                 """, (to_stop_id,))
                                 routes = [row[0] for row in cursor.fetchall()]
