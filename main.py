@@ -29,6 +29,85 @@ from visualization import create_isochrone_map, create_simple_boundary_map, crea
 
 console = Console()
 
+
+def safe_difference(geom1, geom2):
+    """
+    Safely compute geometric difference with validation and error handling
+    
+    Args:
+        geom1: Primary geometry (Shapely geometry)
+        geom2: Geometry to subtract (Shapely geometry)
+    
+    Returns:
+        Result of geom1.difference(geom2) or None if operation fails/empty
+    """
+    try:
+        # Handle None inputs
+        if geom1 is None or geom2 is None:
+            return geom1
+        
+        # Ensure input geometries are valid
+        if hasattr(geom1, 'is_valid') and not geom1.is_valid:
+            geom1 = geom1.buffer(0)
+        if hasattr(geom2, 'is_valid') and not geom2.is_valid:
+            geom2 = geom2.buffer(0)
+            
+        # Compute difference
+        result = geom1.difference(geom2)
+        
+        # Validate and clean result
+        if hasattr(result, 'is_valid') and not result.is_valid:
+            result = result.buffer(0)
+            
+        # Handle empty results
+        if hasattr(result, 'is_empty') and result.is_empty:
+            return None
+            
+        return result
+        
+    except Exception as e:
+        console.print(f"[yellow]Warning: Geometric difference operation failed: {e}[/yellow]")
+        return geom1  # Fallback to original geometry
+
+
+def safe_union(geometries):
+    """
+    Safely compute union of multiple geometries with error handling
+    
+    Args:
+        geometries: List of Shapely geometries
+    
+    Returns:
+        Union geometry or None if operation fails
+    """
+    try:
+        if not geometries:
+            return None
+            
+        # Filter out None geometries and validate
+        valid_geometries = []
+        for geom in geometries:
+            if geom is not None:
+                if hasattr(geom, 'is_valid') and not geom.is_valid:
+                    geom = geom.buffer(0)
+                valid_geometries.append(geom)
+        
+        if not valid_geometries:
+            return None
+            
+        # Compute union
+        result = unary_union(valid_geometries)
+        
+        # Validate result
+        if hasattr(result, 'is_valid') and not result.is_valid:
+            result = result.buffer(0)
+            
+        return result if not (hasattr(result, 'is_empty') and result.is_empty) else None
+        
+    except Exception as e:
+        console.print(f"[yellow]Warning: Geometric union operation failed: {e}[/yellow]")
+        return None
+
 # Cache file for geocoding results
 GEOCODE_CACHE_FILE = ".geocode_cache.json"
 
@@ -839,16 +918,12 @@ def add_schedule_based_walking_expansion(reachable_stops: Dict[str, Dict], conn:
     wgs84_to_utm = pyproj.Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
     utm_to_wgs84 = pyproj.Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
     
-    # Group circles by time ranges
-    time_ranges = [
-        (0, 10, 'very_close'),
-        (10, 20, 'close'), 
-        (20, 30, 'medium'),
-        (30, 45, 'far'),
-        (45, 60, 'very_far')
-    ]
+    # Define time thresholds for cumulative zones
+    time_thresholds = [10, 20, 30, 45, 60]
+    time_range_names = ['very_close', 'close', 'medium', 'far', 'very_far']
     
-    circles_by_range = {name: [] for _, _, name in time_ranges}
+    # Collect all circles with their total travel times for cumulative approach
+    all_circles_with_times = []
     
     # Process each reachable stop
     for stop_id, stop_info in reachable_stops.items():
@@ -891,29 +966,60 @@ def add_schedule_based_walking_expansion(reachable_stops: Dict[str, Dict], conn:
             # Transform circle back to WGS84
             circle_wgs84 = transform(utm_to_wgs84.transform, circle_utm)
             
-            # Determine which time range this stop belongs to
-            for min_time, max_time, range_name in time_ranges:
-                if min_time <= transit_time < max_time:
-                    circles_by_range[range_name].append(circle_wgs84)
-                    break
+            # Store circle with its total travel time (transit + walk to reach the circle edge)
+            # Note: We use transit_time because the circle represents areas walkable FROM this transit stop
+            all_circles_with_times.append((circle_wgs84, transit_time))
     
-    # Compute union for each time range
+    # Create cumulative unions (areas reachable within X minutes total)
+    def create_cumulative_union(max_time):
+        """Create union of all circles for stops reachable within max_time minutes"""
+        relevant_circles = [circle for circle, time in all_circles_with_times if time <= max_time]
+        return safe_union(relevant_circles) if relevant_circles else None
+    
+    # Compute cumulative unions
+    cumulative_unions = {}
+    for i, threshold in enumerate(time_thresholds):
+        if threshold <= max_total_time_minutes:
+            union = create_cumulative_union(threshold)
+            if union:
+                cumulative_unions[threshold] = union
+    
+    # Create non-overlapping zones by subtracting inner areas from outer areas
     union_polygons = {}
-    total_circles = sum(len(circles) for circles in circles_by_range.values())
-    console.print(f"[dim]Computing unions for {total_circles} walking circles across {len(time_ranges)} time ranges[/dim]")
+    total_circles = len(all_circles_with_times)
+    console.print(f"[dim]Computing non-overlapping unions for {total_circles} walking circles across {len(cumulative_unions)} time zones[/dim]")
     
-    for range_name, circles in circles_by_range.items():
-        if circles:
-            console.print(f"[dim]Computing union for {len(circles)} circles in {range_name} range[/dim]")
-            union_poly = unary_union(circles)
-            union_polygons[range_name] = union_poly
+    previous_union = None
+    for i, threshold in enumerate(time_thresholds):
+        if threshold not in cumulative_unions:
+            continue
+            
+        range_name = time_range_names[i]
+        current_union = cumulative_unions[threshold]
+        
+        if previous_union is None:
+            # First zone - no subtraction needed
+            zone_union = current_union
+            zone_desc = f"0-{threshold}min"
+        else:
+            # Subsequent zones - subtract all previous areas
+            zone_union = safe_difference(current_union, previous_union)
+            prev_threshold = time_thresholds[i-1]
+            zone_desc = f"{prev_threshold}-{threshold}min"
+        
+        if zone_union:
+            union_polygons[range_name] = zone_union
             
             # Calculate area for reporting
-            if hasattr(union_poly, 'area'):
-                area_approx = union_poly.area * 111.0 * 111.0  # Rough conversion to km²
-                console.print(f"[green]✓ {range_name}: {len(circles)} circles → {area_approx:.1f} km² union[/green]")
+            if hasattr(zone_union, 'area'):
+                area_approx = zone_union.area * 111.0 * 111.0  # Rough conversion to km²
+                cumulative_area = current_union.area * 111.0 * 111.0 if hasattr(current_union, 'area') else 0
+                console.print(f"[green]✓ {range_name}: {zone_desc} → {area_approx:.1f} km² zone (cumulative: {cumulative_area:.1f} km²)[/green]")
+        
+        # Update previous union for next iteration
+        previous_union = current_union
     
-    console.print(f"[green]Created {len(union_polygons)} time-based walking area unions[/green]")
+    console.print(f"[green]Created {len(union_polygons)} non-overlapping time-based walking area zones[/green]")
     console.print(f"[green]Expanded to {len(expanded_points)} transit stops with line information[/green]")
     
     return expanded_points, union_polygons
